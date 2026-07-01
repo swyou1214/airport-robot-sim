@@ -90,7 +90,7 @@ or drag with the mouse to orbit.
 |---|---|
 | `ROAD_SEGMENTS` | Defines the taxiway network as a list of straight line segments |
 | `a_star()` | Plans a route across a 0.5m grid, avoiding blocked cells |
-| `ideal_route` | The literal centreline path the robot tracks — fixed for the whole run |
+| `ideal_route` | The centreline path the robot tracks — fixed for the whole run |
 | `lookahead_point_on_route()` | Pure-pursuit style steering: projects the robot onto the route and aims a fixed distance ahead |
 | State machine (`DRIVING` / `REVERSING` / `REJOINING`) | Governs collision recovery: stop, back away, plan a local detour, rejoin |
 | `learned_obstacles.json` | Persists collision coordinates between runs — **not** a trained model, just a saved coordinate list reloaded into the planning grid on startup |
