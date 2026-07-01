@@ -1,0 +1,13 @@
+# Generated at runtime -- don't commit collision memory from your own machine
+learned_obstacles.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+venv310/
+*.egg-info/
+
+# OS
+.DS_Store
