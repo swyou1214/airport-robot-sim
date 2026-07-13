@@ -1,140 +1,226 @@
-# Autonomous Airport Luggage Robot — PyBullet Simulation
+# Project ARGO — Autonomous Airport Luggage Robot
 
-A physics-based simulation of an autonomous luggage-transport robot navigating 
-a multi-segment airport taxiway network, built in PyBullet. The robot plans 
-routes with A*, tracks the taxiway centreline using lookahead pursuit steering, 
-and detects and avoids obstacles in real time via a reactive recovery sequence 
-(stop → reverse → detour → rejoin).
+A physics-based simulation of an autonomous luggage-transport robot in
+PyBullet. The robot navigates a multi-segment airport tarmac from a
+depot to a gated jetbridge bay, crossing four roads of moving traffic
+on the way — using pure-pursuit path tracking, predictive crossing
+safety, a reactive collision-recovery state machine, and a Q-learning
+agent that learns gap acceptance at the service-road crossing from its
+own experience, persisted across runs.
 
-![simulation screenshot](docs/screenshot.png)
+![Demo run — depot to gate, with a learned yield at the service-road
+crossing (pink beacon marks the robot; red dots are its driven
+path)](docs/demo.gif)
 
-Future roadmap includes ROS2 integration.
+**Measured performance** (automated evaluation harness, 100 randomized
+episodes each):
+
+- **Learning from scratch** (blank Q-table): 100% navigation success,
+  mean 25.4s depot-to-gate — with every collision/near-miss
+  concentrated in the exploration phase (5 of 6 incident episodes in
+  the first 21; zero in the final 50) →
+  `learning_curve_from-scratch.png`
+- **Trained policy**: 100% success, mean 25.6s, 0.01
+  collisions/episode → `learning_curve_trained-policy.png`
 
 ---
-Feel free to explore the code, open an issue, or build on top of it. 
-Contributions and ideas are welcome!
+
+## Quick start
+
+```bash
+# Python 3.10 virtualenv with pybullet + matplotlib (see install note below)
+python robot_sim.py            # watch one run in the GUI (real time)
+python evaluate.py             # run 20 headless episodes, print stats,
+                               # regenerate learning_curve.png
+```
+
+Every run of `robot_sim.py` updates `q_table.json`, so the crossing
+agent keeps learning across runs — GUI and headless alike.
+
+### GUI controls
+
+- **Arrow keys** — move the camera target (forward/back/strafe)
+- **Mouse drag / scroll** — rotate and zoom (PyBullet defaults);
+  keyboard and mouse control coexist
+
+### macOS 15 install note
+
+PyBullet's vendored zlib conflicts with the macOS 15 SDK. Fix: download
+the PyBullet source, delete line 128 of
+`examples/ThirdPartyLibs/zlib/zutil.h`, then `pip install .`
+
 ---
 
-## Features
+## The world
 
-- **A\* path planning** over a dynamic occupancy grid covering the full
-  taxiway network (main taxiway, parallel service road, cross-connectors,
-  and a gated apron)
-- **Pure-pursuit path tracking** — the robot follows a lookahead point
-  projected onto the road centreline rather than chasing discrete
-  waypoints, for smoother and more accurate lane-following
-- **Reactive collision recovery** — on contact with an obstacle, the robot
-  stops, reverses clear, plans a short detour around the blocked area, and
-  rejoins the original route
-- **Persistent obstacle memory** — collision locations are saved to
-  `learned_obstacles.json` and reloaded on the next run, so previously
-  discovered obstacles are avoided from the start of future simulation
-  episodes
-- **Dual path visualisation** — a fixed yellow line shows the planned ideal
-  route, while a live red trail traces the robot's actual driven path,
-  making divergence (e.g. during a detour) immediately visible
-- **Free-roam debug camera** — pan and orbit with the arrow keys and mouse
-  to inspect the simulation from any angle while it runs
+19 road segments form the tarmac (grey roads with dashed centerlines):
 
-## Motivation
+```
+y=18  ┌─────── apron back ────────┐   ← car, 4.5 m/s
+      │  Gate A  Gate B  Gate C   │
+y=15  │──── apron midline ────────│   ← car, 5.0 m/s
+      │                           │
+y=12  └─────── apron front ───────┘   ← car, 3.5 m/s
+      |         |         |
+y=8   ══════ service road ══════════  ← car, 4.0 m/s  (Q-learning crossing)
+      |         |         |
+      A         B         C           connectors at x=6, 14, 22
+      |         |         |
+y=0   ══════ main taxiway ══════════  (depot at x=0 — no traffic;
+                                       the robot drives along this road)
 
-This project was inspired by home cleaning robots and food/package delivery
-robots, adapted for an airport-transport context. It started as a single-corridor
-pathfinding demo and was iteratively rebuilt into a fuller simulation environment
-for testing navigation and obstacle-avoidance logic without physical hardware.
-
-The focus throughout has been on making the system observable and debuggable,
-visual route overlays, state-machine driven recovery behaviour, and persistent
-memory across runs, rather than simply "does it get to the goal".
-
-## Tech stack
-
-- [PyBullet](https://pybullet.org/) — physics simulation and rendering
-- Python 3.10
-- A* search with a custom grid-based occupancy map
-- No external ML libraries — obstacle memory is a simple persisted
-  coordinate list, not a trained model (see [Architecture](#architecture))
-
-## Getting started
-
-### Prerequisites
-
-- Python 3.10+ (a virtual environment is strongly recommended)
-- macOS users: PyBullet's bundled zlib has a known build issue on macOS 15
-  with recent Xcode command line tools — see [Troubleshooting](#troubleshooting)
-  if `pip install pybullet` fails to compile.
-
-### Installation
-
-```bash
-git clone https://github.com/swyou1214/airport-robot-sim.git
-cd airport-robot-sim
-python3 -m venv venv
-source venv/bin/activate          # macOS/Linux
-pip install pybullet
+Gate bay: walled enclosure y=20–26 centred on x=14 (the destination)
+Parked plane: static aircraft to the right of the bay
 ```
 
-### Running the simulation
+The robot follows the fixed gold-yellow **ideal route** — the literal
+road centerline from the depot, along the taxiway, up connector B, and
+through the apron into the gate bay — via pure pursuit (1m lookahead).
+Its actually-driven path is drawn as a red breadcrumb trail.
 
-```bash
-python3 robot_sim.py
+Each car's starting position and direction are **randomized every
+run**, so no two episodes present the same traffic timing. Set
+`SIM_SEED=<int>` for a reproducible run.
+
+---
+
+## How it works
+
+### Route following
+Normal driving never touches a planner: the robot projects itself onto
+the ideal route and steers toward a point 1m further along it (pure
+pursuit). A* on a 0.5m occupancy grid — constrained to a 1m corridor
+around the road network — is used only *reactively*, to plan short
+detours after a collision.
+
+### Crossing safety (rule-based, apron roads y=12/15/18)
+Before each road the robot holds in a window that ends 1m *before* the
+car's lane (once inside the lane it is committed — it never stops in a
+car's path). It proceeds only when every car's **predicted time to
+reach the crossing** — computed from position, speed, and direction,
+including the bounce at the road's end — exceeds 2.5s. A car whose
+body currently overlaps the crossing blocks it regardless of
+direction.
+
+### Q-learning gap acceptance (service road, y=8)
+At the service-road crossing the WAIT/GO decision is *learned*, not
+hard-coded:
+
+- **State (10):** gap to the nearest car, in 5 buckets
+  (0–3 / 3–5 / 5–7 / 7–9 / 9+ m) × whether that car is **approaching
+  or receding** — the same 6m gap is safe behind a receding car and a
+  near-miss in front of an approaching one
+- **Actions:** WAIT / GO — exactly one decision per approach
+- **Reward:** a GO is scored *after* the crossing completes: +10 if no
+  car came within 2m of the robot, −10 otherwise. A WAIT earns
+  +10 minus 1/s of waiting once traffic clears
+- **Learning:** tabular Q-learning (α=0.3, γ=0.9), ε-greedy
+  exploration decaying 0.30 → 0.05 across runs
+- **Persistence:** `q_table.json`, updated every crossing; the file's
+  state layout is validated on load and auto-reset if the schema
+  changed
+
+A typical learned table — note the direction split at equal distance:
+
+```
+ 0-3m appr: WAIT=+6.2  GO=-2.2  -> prefers WAIT
+ 5-7m rcdg: WAIT= 0.0  GO=+3.0  -> prefers GO
+ 5-7m appr: WAIT=+5.4  GO=-2.0  -> prefers WAIT
+ 7-9m appr: WAIT= 0.0  GO=+11.7 -> prefers GO
 ```
 
-A PyBullet window opens showing the robot at the depot. It will plan a
-route, then drive it automatically. Use the arrow keys to move the camera,
-or drag with the mouse to orbit.
+### Collision recovery
+Contact with any car or wall triggers a state machine: stop →
+**REVERSING** (back off 1.2m) → **REJOINING** (A* detour back onto the
+ideal route) → normal driving. During a detour the rule-based crossing
+guard stays active (including for the service road, since the Q-agent
+isn't consulted mid-detour). Static obstacles (cones, if placed) are
+additionally remembered in `learned_obstacles.json` and avoided from
+the start of future runs; car/wall contacts are deliberately *not*
+persisted — cars move, so their impact location is stale immediately.
 
-## Architecture
+---
 
-| Component | What it does |
+## Evaluation harness
+
+```bash
+python evaluate.py                  # 20 episodes, keep learning
+python evaluate.py -n 50            # more episodes
+python evaluate.py --fresh          # wipe q_table.json first
+python evaluate.py --seed-start 1   # reproducible seeds 1..N
+python evaluate.py --time-limit 180 # per-episode sim-time cap
+python evaluate.py --tag baseline   # label outputs: learning_curve_baseline.png
+```
+
+Each episode runs `robot_sim.py` headless in a fresh subprocess and
+reports success, navigation time, collisions, near-misses, and
+decisions, then the harness aggregates everything into:
+
+- `learning_curve.png` — navigation time, trailing success rate,
+  Q-table convergence (Σ|ΔQ| per episode), and ε decay
+- `eval_results.json` — raw per-episode records + final Q-table
+
+Environment hooks (used by the harness, available manually too):
+
+| Variable | Effect |
 |---|---|
-| `ROAD_SEGMENTS` | Defines the taxiway network as a list of straight line segments |
-| `a_star()` | Plans a route across a 0.5m grid, avoiding blocked cells |
-| `ideal_route` | The centreline path the robot tracks — fixed for the whole run |
-| `lookahead_point_on_route()` | Pure-pursuit style steering: projects the robot onto the route and aims a fixed distance ahead |
-| State machine (`DRIVING` / `REVERSING` / `REJOINING`) | Governs collision recovery: stop, back away, plan a local detour, rejoin |
-| `learned_obstacles.json` | Persists collision coordinates between runs — **not** a trained model, just a saved coordinate list reloaded into the planning grid on startup |
+| `SIM_HEADLESS=1` | no GUI (`p.DIRECT`), no real-time pacing |
+| `SIM_TIME_LIMIT=<s>` | abort the episode as a failure after *s* sim-seconds |
+| `SIM_SEED=<int>` | reproducible traffic + exploration |
+| `SIM_CAPTURE=<path.gif>` | render the run offscreen and write an animated GIF |
 
-### A note on "learning"
+The README demo was captured with:
 
-`learned_obstacles.json` is intentionally simple: it's a list of (x, y)
-points where the robot has previously collided, blocked out in the
-planning grid on the next run. It's best described as **persistent
-episode memory**, not machine learning — there's no model, no training,
-and no generalisation beyond the exact points recorded. A natural next
-step would be an occupancy grid with Bayesian probability updates, which
-would generalise to nearby cells rather than only the exact collision
-point.
+```bash
+SIM_HEADLESS=1 SIM_SEED=205 SIM_CAPTURE=docs/demo.gif python robot_sim.py
+```
+
+---
 
 ## Project structure
 
 ```
-.
-├── robot_sim.py            # main simulation script
-├── learned_obstacles.json  # generated at runtime, gitignored
+airport-robot/
+├── robot_sim.py            # the complete simulation (~1,760 lines)
+├── evaluate.py             # evaluation harness (~300 lines)
+├── q_table.json            # learned crossing policy (auto-generated)
+├── learned_obstacles.json  # static-obstacle memory (auto-generated)
+├── eval_results*.json      # evaluation records (auto-generated; --tag names)
+├── learning_curve*.png     # evaluation figures (auto-generated)
+├── docs/demo.gif           # captured demo run (SIM_CAPTURE)
 ├── README.md
-└── docs/
-    └── screenshot.png
+└── PROJECT_ARGO_SUMMARY.md # technical summary for development
 ```
 
-## Troubleshooting
+## Tuning
 
-<details>
-<summary>pip install pybullet fails to compile on macOS 15</summary>
+All driving constants live near the top of the relevant sections in
+`robot_sim.py`:
 
-PyBullet 3.2.7 bundles a vendored copy of zlib whose `fdopen` macro
-conflicts with the macOS 15 SDK's own `fdopen` declaration. Fix:
-
-```bash
-pip download pybullet --no-binary :all: --no-deps -d /tmp/pybullet_src
-cd /tmp/pybullet_src
-tar xzf pybullet-*.tar.gz
-cd pybullet-*/
-sed -i '' '128d' examples/ThirdPartyLibs/zlib/zutil.h
-pip install .
+```python
+MAX_SPEED = 10.0           # wheel angular velocity (≈1.7 m/s linear)
+WHEEL_FORCE = 35           # motor torque limit
+TURN_GAIN = 8              # steering aggressiveness
+LOOKAHEAD_DISTANCE = 1.0   # pure-pursuit lookahead (m)
+REVERSE_DISTANCE = 1.2     # back-off after collision (m)
+MIN_CROSSING_TIME = 2.5    # predictive crossing threshold (s)
+NEAR_MISS_DISTANCE = 2.0   # Q-reward near-miss radius (m)
+GAP_BUCKETS = [3, 5, 7, 9] # Q-state distance boundaries (m)
 ```
-</details>
 
-## License
+Physics steps at 480 Hz (`p.setTimeStep(1/480)`), matched to the main
+loop's bookkeeping so one loop iteration is 1/480s everywhere and the
+GUI paces in real time.
 
-MIT
+## Known limitations
+
+- The Q-state encodes gap + direction but not car speed, and only the
+  service-road crossing is learned — the apron roads use the fixed
+  predictive rule
+- No same-lane traffic handling (the taxiway is kept car-free by
+  design; there is no overtaking behavior)
+- Single robot; adding a second would need a dispatcher for shared
+  connectors
+- The robot reads car positions from the physics engine directly — no
+  simulated sensors or noise
+- With ε floored at 0.05, rarely-visited Q-states fill in slowly
