@@ -1,13 +1,20 @@
-# Generated at runtime -- don't commit collision memory from your own machine
-learned_obstacles.json
-
 # Python
 __pycache__/
 *.pyc
-.venv/
-venv/
 venv310/
-*.egg-info/
+venv*/
 
-# OS
+# macOS
 .DS_Store
+
+# Claude Code local settings
+.claude/
+
+# Loose desktop screenshots (not part of the documented repo layout)
+Screenshot *.png
+
+# Per-run scratch state that changes on every simulation run.
+# NOTE: the trained q_table.json, eval_results_*.json and
+# learning_curve_*.png ARE committed deliberately -- they're the
+# measured portfolio artifacts referenced by the README.
+learned_obstacles.json
