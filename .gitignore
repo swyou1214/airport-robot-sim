@@ -13,8 +13,12 @@ venv*/
 # Loose desktop screenshots (not part of the documented repo layout)
 Screenshot *.png
 
-# Per-run scratch state that changes on every simulation run.
-# NOTE: the trained q_table.json, eval_results_*.json and
-# learning_curve_*.png ARE committed deliberately -- they're the
-# measured portfolio artifacts referenced by the README.
+# Per-run state that changes on every simulation run. The Q-table is
+# untracked so routine runs don't produce commit noise -- each clone
+# trains its own from scratch, which is also the honest demo of the
+# learning curve.
+# NOTE: eval_results_*.json and learning_curve_*.png ARE committed
+# deliberately -- they're the measured portfolio artifacts the README
+# refers to, and they include the final trained table for reference.
+q_table.json
 learned_obstacles.json
