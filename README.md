@@ -8,9 +8,11 @@ safety, a reactive collision-recovery state machine, and a Q-learning
 agent that learns gap acceptance at the service-road crossing from its
 own experience, persisted across runs.
 
-![Demo run — depot to gate, with a learned yield at the service-road
-crossing (pink beacon marks the robot; red dots are its driven
-path)](docs/demo.gif)
+![Demo run — 3D view and navigation view side by side, depot to gate.
+The light above the robot shows its drive command: green = GO, red =
+STOP. Watch both panels at the service-road crossing: the light turns
+red, the map banner reads STOP, and the readout drops to 0.0
+m/s.](docs/demo.gif)
 
 **Measured performance** (automated evaluation harness, 100 randomized
 episodes each):
@@ -35,13 +37,38 @@ python evaluate.py             # run 20 headless episodes, print stats,
 ```
 
 Every run of `robot_sim.py` updates `q_table.json`, so the crossing
-agent keeps learning across runs — GUI and headless alike.
+agent keeps learning across runs — GUI and headless alike. That file
+is not tracked in git: a fresh clone starts from a blank table and
+trains its own, exactly as the from-scratch curve above shows. (The
+trained table those measurements ended on is preserved as
+`final_q_table` inside `eval_results_trained-policy.json`.)
 
 ### GUI controls
 
 - **Arrow keys** — move the camera target (forward/back/strafe)
 - **Mouse drag / scroll** — rotate and zoom (PyBullet defaults);
   keyboard and mouse control coexist
+
+### Navigation view
+
+A second window ("ARGO - Navigation View") opens alongside the 3D
+view: a turn-by-turn style 2D map centred on the robot, showing the
+road layout, the planned route, the driven trail, live traffic, a
+GO/STOP banner, and distance/ETA/speed to the gate. The robot stays
+in the middle and the map slides under it, like a car navigation
+display. Run with `SIM_MAP=0` to suppress it.
+
+- **`+` / `−` buttons** (top right, or the `+`/`−` keys) zoom between
+  a close follow view and the whole tarmac.
+
+It renders in its own process ([nav_map.py](nav_map.py)) and the
+simulation streams it small state messages over a non-blocking pipe —
+a matplotlib redraw costs ~60ms, which inline would stall the 480 Hz
+loop and break real-time pacing. If the window is closed or falls
+behind, updates are dropped and the simulation carries on. The map
+never *blocks* the simulation, but the two processes do share the
+machine: on integrated graphics, a GUI run measured ~20% slower with
+the map open.
 
 ### macOS 15 install note
 
@@ -168,6 +195,7 @@ Environment hooks (used by the harness, available manually too):
 | `SIM_TIME_LIMIT=<s>` | abort the episode as a failure after *s* sim-seconds |
 | `SIM_SEED=<int>` | reproducible traffic + exploration |
 | `SIM_CAPTURE=<path.gif>` | render the run offscreen and write an animated GIF |
+| `SIM_MAP=0` | suppress the 2D navigation map window |
 
 The README demo was captured with:
 
@@ -175,16 +203,22 @@ The README demo was captured with:
 SIM_HEADLESS=1 SIM_SEED=205 SIM_CAPTURE=docs/demo.gif python robot_sim.py
 ```
 
+`SIM_CAPTURE` renders both panels offscreen — the 3D scene through
+PyBullet's software renderer, and the navigation map through
+`nav_map.py`'s own drawing code, so the recorded map can never drift
+from the live one.
+
 ---
 
 ## Project structure
 
 ```
 airport-robot/
-├── robot_sim.py            # the complete simulation (~1,760 lines)
+├── robot_sim.py            # the complete simulation (~1,890 lines)
+├── nav_map.py              # 2D navigation map window (separate process)
 ├── evaluate.py             # evaluation harness (~300 lines)
-├── q_table.json            # learned crossing policy (auto-generated)
-├── learned_obstacles.json  # static-obstacle memory (auto-generated)
+├── q_table.json            # learned crossing policy (auto-generated, untracked)
+├── learned_obstacles.json  # static-obstacle memory (auto-generated, untracked)
 ├── eval_results*.json      # evaluation records (auto-generated; --tag names)
 ├── learning_curve*.png     # evaluation figures (auto-generated)
 ├── docs/demo.gif           # captured demo run (SIM_CAPTURE)
