@@ -6,6 +6,7 @@ import heapq
 import json
 import os
 import random
+import sys
 
 # Optional reproducibility: run with SIM_SEED=<int> to make the
 # randomised traffic (and the Q-agent's ε-greedy exploration)
@@ -29,9 +30,17 @@ SIM_TIME_LIMIT = float(os.environ.get("SIM_TIME_LIMIT", "0"))
 #                             route/trail are drawn as real geometry
 #                             since debug lines don't render offscreen)
 SIM_CAPTURE = os.environ.get("SIM_CAPTURE", "")
-CAPTURE_FPS = 10         # captured frames per simulated second
+CAPTURE_FPS = 8          # captured frames per simulated second
 CAPTURE_SPEEDUP = 2.0    # GIF playback speed vs simulated time
 CAPTURE_SIZE = (640, 400)
+CAPTURE_SCALE = 0.82     # downscale factor applied when writing the GIF
+CAPTURE_COLORS = 128     # GIF palette size; below ~96 the traffic
+                         # colours visibly shift (blue reads as teal)
+
+#   SIM_MAP=0          -> suppress the 2D navigation map window that
+#                         normally opens alongside the 3D GUI view
+SIM_MAP = (not SIM_HEADLESS) and os.environ.get("SIM_MAP", "1") == "1"
+MAP_UPDATE_EVERY = 24    # sim frames between map messages (~20 Hz)
 
 # ---------------------------------------------------------
 # 1. SET UP THE WORLD
@@ -1034,12 +1043,65 @@ if SIM_CAPTURE:
         rgbaColor=[0.80, 0.82, 0.79, 1])
     p.createMultiBody(0, -1, ground_vis, basePosition=[14, 12, 0.0005])
 
-    # A bright beacon floats above the robot in captures -- the husky
-    # itself is only ~10px at this zoom and vanishes against the road.
-    beacon_vis = p.createVisualShape(p.GEOM_SPHERE, radius=0.3,
-                                     rgbaColor=[1.0, 0.1, 0.6, 1])
-    capture_beacon = p.createMultiBody(
-        0, -1, beacon_vis, basePosition=[start_pos[0], start_pos[1], 1.2])
+    # (The robot marker in captures is the GO/STOP signal light defined
+    # below -- it follows the robot and shows its drive command.)
+
+    # Second panel for the demo GIF: the same navigation map the live
+    # window shows, rendered offscreen through nav_map's own drawing
+    # code so the two can never drift apart. Sized to match the 3D
+    # panel's height so they composite side by side.
+    MAP_PANEL_PX = CAPTURE_SIZE[1]
+    capture_map = None
+    try:
+        import matplotlib
+        matplotlib.use("Agg", force=True)
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import nav_map as navmap
+
+        map_fig, map_ax, map_art = navmap.build_figure(
+            {
+                "roads": [[list(s), list(e)] for (s, e) in ROAD_SEGMENTS],
+                "route": [list(pt) for pt in ideal_route],
+                "bay": [BAY_X - BAY_W, BAY_Y0, BAY_X + BAY_W, BAY_Y1],
+                "target": list(target_pos),
+                "car_colors": [cfg["color"][:3] for cfg in car_configs],
+            },
+            figsize=(MAP_PANEL_PX / 100.0, MAP_PANEL_PX / 100.0),
+            controls=False)
+        map_fig.set_dpi(100)
+        capture_map = dict(fig=map_fig, ax=map_ax, art=map_art,
+                           trail_x=[], trail_y=[])
+    except Exception as exc:
+        print(f"Map panel unavailable for capture ({exc}) -- "
+              f"capturing the 3D view only.")
+
+    def render_map_panel(rx, ry, hd, signal, remaining, speed, state_name):
+        """Draw one navigation-map frame and return it as an RGB array."""
+        cap = capture_map
+        art = cap["art"]
+        art["robot"].set_xy(navmap.robot_marker(rx, ry, hd))
+        color = navmap.GO_COLOR if signal == "GO" else navmap.STOP_COLOR
+        art["robot"].set_facecolor(color)
+        art["banner"].set_text(signal)
+        art["banner"].get_bbox_patch().set_facecolor(color)
+
+        tx, ty = cap["trail_x"], cap["trail_y"]
+        if not tx or math.hypot(rx - tx[-1], ry - ty[-1]) > 0.12:
+            tx.append(rx)
+            ty.append(ry)
+            art["trail"].set_data(tx, ty)
+
+        for patch, car in zip(art["cars"], cars):
+            patch.set_xy((car["x"] - 0.8, car["y"] - 0.35))
+
+        eta = f"{remaining / speed:.0f}s" if speed > 0.25 else "--"
+        art["readout"].set_text(
+            f"{remaining:5.1f} m to gate     ETA {eta}     "
+            f"{speed:4.1f} m/s     {state_name}")
+
+        navmap.apply_view(cap["ax"], rx, ry)
+        cap["fig"].canvas.draw()
+        return np.asarray(cap["fig"].canvas.buffer_rgba())[:, :, :3]
 
     capture_frames = []
     next_capture_time = 0.0
@@ -1050,6 +1112,93 @@ if SIM_CAPTURE:
     CAPTURE_PROJ = p.computeProjectionMatrixFOV(
         fov=60, aspect=CAPTURE_SIZE[0] / CAPTURE_SIZE[1],
         nearVal=0.1, farVal=100)
+
+# ---------------------------------------------------------
+# GO/STOP SIGNAL LIGHT (mounted above the robot)
+# ---------------------------------------------------------
+# A status light hovers above the robot showing the wheel command
+# currently being sent: GREEN while it is commanded to move, RED while
+# it is commanded to hold (Q-agent wait, rule-based crossing hold, or
+# a collision stop). Being part of the scene, it is visible from any
+# third-person camera angle in the GUI and also renders in offscreen
+# GIF captures -- where it doubles as the robot marker (the husky
+# itself is only ~10px at capture zoom).
+drive_signal = "GO"         # recomputed every frame by the control logic
+light_shown_signal = None
+SIGNAL_LIGHT_HEIGHT = 0.55  # metres above the robot's base
+SIGNAL_GO_COLOR = [0.1, 0.8, 0.2, 1]
+SIGNAL_STOP_COLOR = [0.9, 0.1, 0.1, 1]
+
+_light_vis = p.createVisualShape(p.GEOM_SPHERE, radius=0.25,
+                                 rgbaColor=SIGNAL_GO_COLOR)
+signal_light_id = p.createMultiBody(
+    0, -1, _light_vis,
+    basePosition=[start_pos[0], start_pos[1], SIGNAL_LIGHT_HEIGHT])
+
+# ---------------------------------------------------------
+# NAVIGATION MAP WINDOW (separate process -- see nav_map.py)
+# ---------------------------------------------------------
+# A 2D turn-by-turn style map opens alongside the 3D view. It runs as
+# its own process because a matplotlib redraw costs ~60ms; inline that
+# would stall this 480Hz loop and wreck real-time pacing. Here the sim
+# only writes a small JSON line per update, and the pipe write is
+# non-blocking, so a slow or closed map window can never hold up the
+# simulation.
+map_proc = None
+
+def start_nav_map():
+    """Launch the map process and send it the static layout."""
+    global map_proc
+    import subprocess
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "nav_map.py")
+    try:
+        # stdout is discarded so the map process can never hold open a
+        # pipeline reading the simulation's output (its stderr is kept
+        # so genuine errors still surface).
+        map_proc = subprocess.Popen(
+            [sys.executable, script], stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, text=True)
+        os.set_blocking(map_proc.stdin.fileno(), False)
+        send_to_map({
+            "type": "init",
+            "roads": [[list(s), list(e)] for (s, e) in ROAD_SEGMENTS],
+            "route": [list(pt) for pt in ideal_route],
+            "bay": [BAY_X - BAY_W, BAY_Y0, BAY_X + BAY_W, BAY_Y1],
+            "target": list(target_pos),
+            "car_colors": [cfg["color"][:3] for cfg in car_configs],
+        })
+        print("Navigation map window opened (set SIM_MAP=0 to disable).")
+    except Exception as exc:
+        print(f"Navigation map unavailable ({exc}) -- continuing without it.")
+        map_proc = None
+
+def send_to_map(payload):
+    """Non-blocking write; drops the update rather than stalling the
+    sim if the pipe is full, and disables the map if it has closed."""
+    global map_proc
+    if map_proc is None or map_proc.stdin is None:
+        return
+    try:
+        map_proc.stdin.write(json.dumps(payload) + "\n")
+        map_proc.stdin.flush()
+    except (BlockingIOError, InterruptedError):
+        pass          # map is behind -- skip this frame's update
+    except (BrokenPipeError, ValueError, OSError):
+        map_proc = None   # window closed; carry on without it
+
+def update_signal_light(signal, robot_pos):
+    """Keep the light riding above the robot; recolor on signal change."""
+    global light_shown_signal
+    p.resetBasePositionAndOrientation(
+        signal_light_id,
+        [robot_pos[0], robot_pos[1], robot_pos[2] + SIGNAL_LIGHT_HEIGHT],
+        p.getQuaternionFromEuler([0, 0, 0]))
+    if signal != light_shown_signal:
+        p.changeVisualShape(signal_light_id, -1,
+                            rgbaColor=(SIGNAL_GO_COLOR if signal == "GO"
+                                       else SIGNAL_STOP_COLOR))
+        light_shown_signal = signal
 
 # ---------------------------------------------------------
 # 4. DRIVE THE ROBOT ALONG THE WAYPOINTS
@@ -1322,30 +1471,78 @@ episode_near_misses = 0
 episode_go_decisions = 0
 episode_wait_decisions = 0
 
+if SIM_MAP:
+    start_nav_map()
+
 print("Driving along planned path...")
 sim_time = 0.0
+map_frame_count = 0
 
 while True:
     if not p.isConnected():
         print("Simulation window was closed -- exiting.")
         break
 
-    p.stepSimulation()
-    if not SIM_HEADLESS:
-        update_camera_from_keys()
-        time.sleep(1. / 480.)
-    sim_time += 1. / 480.
+    # The isConnected() check above can still race a window close that
+    # lands mid-frame, so the physics calls are guarded: closing the
+    # GUI should end the run tidily (and still write the summary and
+    # Q-table below) rather than raising out of the loop.
+    try:
+        p.stepSimulation()
+        if not SIM_HEADLESS:
+            update_camera_from_keys()
+            time.sleep(1. / 480.)
+        sim_time += 1. / 480.
 
-    if SIM_TIME_LIMIT > 0 and sim_time > SIM_TIME_LIMIT:
-        print(f"Episode timed out after {SIM_TIME_LIMIT:.0f} simulated seconds.")
+        if SIM_TIME_LIMIT > 0 and sim_time > SIM_TIME_LIMIT:
+            print(f"Episode timed out after {SIM_TIME_LIMIT:.0f} "
+                  f"simulated seconds.")
+            break
+
+        # Advance all traffic cars along the taxiway each frame
+        update_cars(1. / 480.)
+
+        pos, orn = p.getBasePositionAndOrientation(robot)
+        euler = p.getEulerFromQuaternion(orn)
+        heading = euler[2]
+    except p.error:
+        print("Simulation window was closed -- exiting.")
         break
 
-    # Advance all traffic cars along the taxiway each frame
-    update_cars(1. / 480.)
+    # Keep the GO/STOP light riding above the robot. It shows the
+    # signal computed by the previous frame's control logic (a 1-frame
+    # lag at 480 Hz -- imperceptible).
+    update_signal_light(drive_signal, pos)
 
-    pos, orn = p.getBasePositionAndOrientation(robot)
-    euler = p.getEulerFromQuaternion(orn)
-    heading = euler[2]
+    # Feed the 2D navigation map window.
+    if map_proc is not None:
+        map_frame_count += 1
+        if map_frame_count % MAP_UPDATE_EVERY == 0:
+            _, _, map_remaining = lookahead_point_on_route(
+                ideal_route, (pos[0], pos[1]), LOOKAHEAD_DISTANCE)
+            vel, _ = p.getBaseVelocity(robot)
+            send_to_map({
+                "type": "state",
+                "t": round(sim_time, 2),
+                "robot": [round(pos[0], 3), round(pos[1], 3),
+                          round(heading, 3)],
+                "signal": drive_signal,
+                "state": state,
+                "cars": [[round(c["x"], 2), round(c["y"], 2)] for c in cars],
+                "remaining": round(map_remaining, 2),
+                "speed": round(math.hypot(vel[0], vel[1]), 2),
+            })
+
+    # The control logic below recomputes drive_signal for THIS frame,
+    # so the settled value from the previous frame is kept for the
+    # visual overlays (signal light, map panel, GIF). Without this the
+    # capture below would read the freshly-reset "GO" every time and
+    # never record a STOP.
+    shown_signal = drive_signal
+
+    # Default drive signal for this frame; any branch below that
+    # commands the wheels to hold overrides it to STOP.
+    drive_signal = "GO"
 
     # ---- Offscreen GIF capture (placed before any `continue` so
     # frames keep flowing while the robot holds at a crossing) ----
@@ -1360,16 +1557,27 @@ while True:
             last_capture_marker = (pos[0], pos[1])
         if sim_time >= next_capture_time:
             next_capture_time += 1.0 / CAPTURE_FPS
-            p.resetBasePositionAndOrientation(
-                capture_beacon, [pos[0], pos[1], 1.2],
-                p.getQuaternionFromEuler([0, 0, 0]))
             _, _, rgb, _, _ = p.getCameraImage(
                 CAPTURE_SIZE[0], CAPTURE_SIZE[1],
                 CAPTURE_VIEW, CAPTURE_PROJ,
                 renderer=p.ER_TINY_RENDERER)
             # Defensive copy: PyBullet doesn't guarantee ownership of
             # the returned pixel buffer across getCameraImage calls.
-            capture_frames.append(np.array(rgb, dtype=np.uint8, copy=True))
+            panel_3d = np.reshape(np.array(rgb, dtype=np.uint8, copy=True),
+                                  (CAPTURE_SIZE[1], CAPTURE_SIZE[0], 4))[:, :, :3]
+
+            if capture_map is not None:
+                _, _, cap_remaining = lookahead_point_on_route(
+                    ideal_route, (pos[0], pos[1]), LOOKAHEAD_DISTANCE)
+                cap_vel, _ = p.getBaseVelocity(robot)
+                panel_map = render_map_panel(
+                    pos[0], pos[1], heading, shown_signal, cap_remaining,
+                    math.hypot(cap_vel[0], cap_vel[1]), state)
+                divider = np.full((CAPTURE_SIZE[1], 3, 3), 210, dtype=np.uint8)
+                capture_frames.append(
+                    np.hstack([panel_3d, divider, panel_map]))
+            else:
+                capture_frames.append(panel_3d)
 
     # ---- Q-learning: gap acceptance at the service-road crossing ----
     # When the robot is climbing connector B and nears the service
@@ -1438,6 +1646,7 @@ while True:
                     episode_wait_decisions += 1
                     state = STATE_WAITING
                     wait_start_time = sim_time
+                    drive_signal = "STOP"
                     print(f"Q-agent: GAP={gap:.1f}m "
                           f"{'closing' if car_approaching else 'receding'} "
                           f"({state_label(current_state)}) "
@@ -1485,6 +1694,7 @@ while True:
                     # re-deciding on every remaining frame in the zone.
                     q_crossing_done = True
                 else:
+                    drive_signal = "STOP"
                     for joint in WHEEL_JOINTS:
                         p.setJointMotorControl2(robot, joint, p.VELOCITY_CONTROL,
                                                  targetVelocity=0, force=15)
@@ -1514,6 +1724,7 @@ while True:
                 eta = car_time_to_crossing(road["y"], CROSSING_X)
                 if eta < MIN_CROSSING_TIME:
                     blocked_by_car = True
+                    drive_signal = "STOP"
                     for joint in WHEEL_JOINTS:
                         p.setJointMotorControl2(robot, joint, p.VELOCITY_CONTROL,
                                                  targetVelocity=0, force=15)
@@ -1582,6 +1793,7 @@ while True:
 
     if collided_cone_pos is not None or transient_hit:
         episode_collisions += 1
+        drive_signal = "STOP"
         # Stop immediately, then switch to REVERSING -- back straight
         # away from the obstacle before any replanning is attempted.
         for joint in WHEEL_JOINTS:
@@ -1738,11 +1950,27 @@ if SIM_CAPTURE and capture_frames:
     import numpy as np
     from PIL import Image
     print(f"Writing {len(capture_frames)} frames to {SIM_CAPTURE} ...")
-    pil_frames = []
-    for rgb in capture_frames:
-        arr = np.reshape(np.asarray(rgb, dtype=np.uint8),
-                         (CAPTURE_SIZE[1], CAPTURE_SIZE[0], 4))[:, :, :3]
-        pil_frames.append(Image.fromarray(arr))
+    # Downscale, then quantise every frame to ONE shared palette. The
+    # side-by-side composite is ~1.7MB at full size, too heavy for the
+    # top of a README. The shared palette matters: quantising frames
+    # independently gives each its own colour table and defeats the
+    # GIF's inter-frame compression (measured 5.2MB that way, vs a few
+    # hundred KB here).
+    def _prep(frame):
+        img = Image.fromarray(frame)
+        return img.resize((int(img.width * CAPTURE_SCALE),
+                           int(img.height * CAPTURE_SCALE)), Image.LANCZOS)
+
+    # Derive the shared palette from frames sampled across the whole
+    # run, not a single one: a colour absent from the sample frame
+    # (a car parked off-screen at that instant) gets approximated to
+    # the nearest available one for the entire GIF -- which is what
+    # turned the blue car teal.
+    step = max(1, len(capture_frames) // 12)
+    palette = Image.fromarray(
+        np.vstack(capture_frames[::step])).quantize(colors=CAPTURE_COLORS)
+    pil_frames = [_prep(frame).quantize(palette=palette, dither=Image.NONE)
+                  for frame in capture_frames]
     out_dir = os.path.dirname(os.path.abspath(SIM_CAPTURE))
     os.makedirs(out_dir, exist_ok=True)
     pil_frames[0].save(SIM_CAPTURE, save_all=True,
@@ -1757,6 +1985,14 @@ print(f"RESULT success={int(target_reached)} sim_time={sim_time:.2f} "
       f"collisions={episode_collisions} near_misses={episode_near_misses} "
       f"go={episode_go_decisions} wait={episode_wait_decisions} "
       f"epsilon={q_epsilon:.4f} run={q_run_count}")
+
+# Closing the map's stdin tells it the run is over; it closes its
+# window and exits on its own.
+if map_proc is not None:
+    try:
+        map_proc.stdin.close()
+    except OSError:
+        pass
 
 if p.isConnected():
     p.disconnect()
