@@ -27,7 +27,7 @@ Goals:
 airport-robot/
 ├── robot_sim.py            # Main simulation (~1,760 lines)
 ├── evaluate.py             # Evaluation harness (~300 lines)
-├── q_table.json            # Q-learning state, persists across runs (auto-generated)
+├── q_table.json            # Q-learning state, persists across runs (auto-generated, gitignored)
 ├── learned_obstacles.json  # Static-obstacle memory (auto-generated)
 ├── eval_results*.json      # Evaluation records (auto-generated; --tag names)
 ├── learning_curve*.png     # Evaluation figures (auto-generated)
@@ -195,9 +195,12 @@ python evaluate.py [-n N] [--fresh] [--seed-start K] [--time-limit S] [--tag NAM
 Sim-side hooks (env vars, all no-ops in normal GUI use):
 `SIM_HEADLESS=1` (p.DIRECT, no sleep), `SIM_TIME_LIMIT` (abort as
 failure), `SIM_SEED` (reproducibility), `SIM_CAPTURE=<path.gif>`
-(offscreen GIF capture: route/trail drawn as real geometry since debug
-lines don't render offscreen, robot marked with a beacon sphere,
-frames via TinyRenderer at 10 fps, played back 2x). Every run prints
+(offscreen GIF capture: a side-by-side composite of the 3D view via
+TinyRenderer and the navigation map rendered through nav_map's own
+drawing code under Agg; route/trail drawn as real geometry since debug
+lines don't render offscreen, robot marked by its GO/STOP signal
+light; 8 fps, played back 2x, quantised to a run-wide shared palette).
+Every run prints
 `RESULT success=… sim_time=… collisions=… near_misses=… go=… wait=…
 epsilon=… run=…`.
 
