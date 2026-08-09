@@ -1,5 +1,7 @@
 # Project ARGO — Autonomous Airport Luggage Robot
 
+![CI](https://github.com/swyou1214/YOUR-REPO-NAME/actions/workflows/ci.yml/badge.svg)
+
 A physics-based simulation of an autonomous luggage-transport robot in
 PyBullet. The robot navigates a multi-segment airport tarmac from a
 depot to a gated jetbridge bay, crossing four roads of moving traffic
@@ -245,6 +247,25 @@ GAP_BUCKETS = [3, 5, 7, 9] # Q-state distance boundaries (m)
 Physics steps at 480 Hz (`p.setTimeStep(1/480)`), matched to the main
 loop's bookkeeping so one loop iteration is 1/480s everywhere and the
 GUI paces in real time.
+
+## Tests & CI
+
+```bash
+python -m pytest -v        # 13 tests, ~50s locally
+```
+
+- **Unit tests** — `nav_map`'s geometry (marker rotation, road
+  polygons, view centring, zoom limits) and `evaluate`'s aggregation
+  helpers (Q-table deltas, rolling success rate)
+- **End-to-end tests** — full headless episodes of `robot_sim.py`
+  (seeded and unseeded) asserting the robot reaches the gate, plus a
+  capped capture run asserting the composite GIF pipeline produces a
+  valid two-panel animation
+
+GitHub Actions runs the same suite on every push and pull request
+(`.github/workflows/ci.yml`). `robot_sim.py`'s internals (A*,
+crossing prediction, Q-updates) are covered through the end-to-end
+episodes; direct unit tests for them await the planned module split.
 
 ## Known limitations
 
