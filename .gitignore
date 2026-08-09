@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 venv310/
 venv*/
+.pytest_cache/
 
 # macOS
 .DS_Store
