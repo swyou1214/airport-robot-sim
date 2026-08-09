@@ -1,6 +1,6 @@
 # Project ARGO — Autonomous Airport Luggage Robot
 
-![CI](https://github.com/swyou1214/YOUR-REPO-NAME/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/swyou1214/airport-robot-sim/actions/workflows/ci.yml/badge.svg)
 
 A physics-based simulation of an autonomous luggage-transport robot in
 PyBullet. The robot navigates a multi-segment airport tarmac from a
