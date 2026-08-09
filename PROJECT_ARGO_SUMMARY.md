@@ -311,8 +311,14 @@ GAP_BUCKETS = [3, 5, 7, 9]  # Q-state distance boundaries (m)
 
 ### Lower priority
 - [ ] **Gate selection** — runtime gate assignment (A/B/C)
-- [ ] **Unit tests** for a_star, smooth_path, has_clear_line,
-      find_rejoin_target, car_time_to_crossing, q_state
+- [x] **Tests + CI** — pytest suite (nav_map geometry, evaluate
+      helpers, headless end-to-end episodes, capture pipeline) run by
+      GitHub Actions on every push (.github/workflows/ci.yml).
+      Still open: direct unit tests for a_star, smooth_path,
+      has_clear_line, find_rejoin_target, car_time_to_crossing and
+      q_state -- robot_sim.py executes at import, so those need the
+      module split first (they're covered indirectly by the
+      end-to-end episodes meanwhile)
 - [x] **Screen recording / GIF** — `docs/demo.gif` (seed 205: clean
       run with a learned WAIT at the service-road crossing), captured
       via the `SIM_CAPTURE` hook
