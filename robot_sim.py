@@ -24,6 +24,37 @@ if _seed is not None:
 SIM_HEADLESS = os.environ.get("SIM_HEADLESS") == "1"
 SIM_TIME_LIMIT = float(os.environ.get("SIM_TIME_LIMIT", "0"))
 
+# A/B comparison hooks (see `evaluate.py --ab`):
+#   SIM_CROSSING=q|rule -> which controller decides the service-road
+#                          crossing. "q" is the Q-learning agent (the
+#                          default, and what the project is about);
+#                          "rule" hands that crossing to the same
+#                          predictive time-to-crossing guard the apron
+#                          roads use, giving a hand-written baseline to
+#                          measure the learned policy against.
+#   SIM_FREEZE_Q=1      -> evaluate the learned policy as-is: greedy
+#                          (no exploration), no Q updates, nothing
+#                          written to q_table.json. Without this, an
+#                          A/B measures exploration noise and the
+#                          policy drifts mid-comparison.
+SIM_CROSSING = os.environ.get("SIM_CROSSING", "q").lower()
+SIM_FREEZE_Q = os.environ.get("SIM_FREEZE_Q") == "1"
+
+#   SIM_RETURN=1 -> after reaching the gate, drive back to the depot by
+#                   a DIFFERENT route (see return_route below) instead
+#                   of ending the episode at the gate. Off by default so
+#                   the documented depot-to-gate measurements -- the
+#                   evaluation baselines and the A/B -- keep measuring
+#                   the same task they were recorded against.
+SIM_RETURN = os.environ.get("SIM_RETURN") == "1"
+
+#   SIM_ROBOTS=2 -> deploy a second robot from the depot at the moment
+#                   the first turns for home. Needs SIM_RETURN, since
+#                   that turn is the trigger. Opt-in, like the rest.
+SIM_ROBOTS = int(os.environ.get("SIM_ROBOTS", "1"))
+if SIM_CROSSING not in ("q", "rule"):
+    raise SystemExit(f"SIM_CROSSING must be 'q' or 'rule', got {SIM_CROSSING!r}")
+
 #   SIM_CAPTURE=<path.gif> -> render the run offscreen with PyBullet's
 #                             software renderer and write an animated
 #                             GIF (combine with SIM_HEADLESS=1; the
@@ -97,6 +128,11 @@ def draw_road_segment(x1, y1, x2, y2, width=4):
 
 # Road network: start corridor -> 90-degree junction -> diagonal
 # shortcut -> final straight stretch into the gate
+# North apron taxiline: the lane the return leg runs in. Painted only
+# when the return leg exists, so the default depot-to-gate map -- and
+# every measurement recorded against it -- is untouched.
+APRON_RETURN_LANE = 16.8
+
 ROAD_SEGMENTS = [
     # Main taxiway (full width, bottom) -- this is where cars drive
     ((0, 0),  (28, 0)),
@@ -125,6 +161,9 @@ ROAD_SEGMENTS = [
     # Gate bay interior: single centreline through the bay
     ((14, 20), (14, 26)),  # inside the gate bay
 ]
+
+if SIM_RETURN:
+    ROAD_SEGMENTS.append(((4, APRON_RETURN_LANE), (24, APRON_RETURN_LANE)))
 
 for (start, end) in ROAD_SEGMENTS:
     draw_road_segment(start[0], start[1], end[0], end[1])
@@ -641,6 +680,8 @@ def load_q_table():
     return q_table, Q_EPSILON, 0, 0
 
 def save_q_table(q_table, epsilon, run_count, total_crossings):
+    if SIM_FREEZE_Q:
+        return   # evaluation run: leave the learned table untouched
     with open(Q_FILE, "w") as f:
         json.dump({
             "q_table": q_table,
@@ -694,6 +735,97 @@ def nearest_crossing_car_distance(px, py):
         return float("inf")
     return min(math.hypot(car["x"] - px, car["y"] - py)
                for car in road_cars)
+
+TRAFFIC_ROAD_YS = [cfg["y"] for cfg in car_configs]   # roads with cars
+
+# Where to wait before entering a shared lane. This has to sit in the
+# gap BETWEEN two roads, and the apron roads are only 3m apart: with a
+# ~1m-long robot and cars 0.35m either side of a centreline, the only
+# safe band between y=15 and y=18 is a centre at 15.85..17.15. Hence a
+# tight window ~1.2-1.8m short of the target lane -- an earlier 1.5-3.5m
+# window let the robot park at y=18.5, i.e. inside the apron-back road,
+# where passing traffic hit it repeatedly.
+LANE_ENTRY_STANDOFF_MIN = 1.2
+LANE_ENTRY_STANDOFF_MAX = 1.8
+
+# Crossing hold windows. Climbing (the outbound leg) waits below the
+# road; descending (the return leg) waits above it and needs a bigger
+# standoff, because at only 1.0m the robot's trailing edge sits 0.15m
+# from a passing car.
+CROSSING_DOWN_COMMIT_MARGIN = 1.0
+CROSSING_DOWN_STOP_MARGIN = 2.0   # not 2.5: the roads are 3m apart, so a
+                                  # 2.5m window reaches into the NEXT road's
+                                  # car lane -- holding for the apron front
+                                  # then parked the robot in midline traffic
+
+ROBOT_LANE_SPEED = 1.4    # conservative linear speed estimate (m/s) for
+                          # lane reservation. Deliberately below the ~1.7
+                          # the robot actually manages: assuming it is
+                          # slower makes the predicted occupancy longer,
+                          # so the check errs toward waiting.
+
+def lane_conflict_free(road_y, x_from, x_to, step=0.1, start_delay=1.0):
+    """Would the robot meet a car if it drove ALONG `road_y` from
+    `x_from` to `x_to` starting now?
+
+    Forward-simulates both the robot and every car on that road,
+    bounces included, and reports whether they ever come within a
+    body-length of each other. This is the shared-lane counterpart of
+    car_time_to_crossing(): crossing needs a gap at one point, but
+    travelling along a lane needs the conflict to be absent for the
+    whole traversal -- and crucially the robot only has to avoid the
+    car where it actually is at each instant, not keep the entire leg
+    clear, which no gap on these roads would ever satisfy.
+
+    `start_delay` covers the turn onto the road before the robot is
+    actually moving along it.
+    """
+    direction = 1.0 if x_to > x_from else -1.0
+    margin = CAR_HALF_WIDTH + ROBOT_HALF_WIDTH + 0.3
+    for car in cars:
+        if abs(car["y"] - road_y) > 0.5:
+            continue
+        car_x, car_v = car["x"], car["speed"]
+        robot_x = x_from
+        elapsed = 0.0
+        # Advance the car alone through the turn, robot still stationary.
+        while elapsed < start_delay:
+            if abs(car_x - robot_x) < margin:
+                return False
+            car_x += car_v * step
+            if car_x > car["xmax"]:
+                car_x, car_v = car["xmax"], -abs(car_v)
+            elif car_x < car["xmin"]:
+                car_x, car_v = car["xmin"], abs(car_v)
+            elapsed += step
+        # Now both move until the robot clears the leg.
+        while True:
+            if abs(car_x - robot_x) < margin:
+                return False
+            robot_x += direction * ROBOT_LANE_SPEED * step
+            if (direction > 0 and robot_x >= x_to) or \
+               (direction < 0 and robot_x <= x_to):
+                break          # robot is off the shared lane -- safe
+            car_x += car_v * step
+            if car_x > car["xmax"]:
+                car_x, car_v = car["xmax"], -abs(car_v)
+            elif car_x < car["xmin"]:
+                car_x, car_v = car["xmin"], abs(car_v)
+    return True
+
+def route_leg_at(route, px, py):
+    """Nearest route segment to (px,py) plus the one after it, each as
+    ((x1,y1),(x2,y2)). Used to tell "crossing this road" from
+    "driving along it" and to know which way the robot is heading."""
+    best_i, best_d = 0, float("inf")
+    for i in range(len(route) - 1):
+        d = distance_to_segment(px, py, route[i][0], route[i][1],
+                                route[i + 1][0], route[i + 1][1])
+        if d < best_d:
+            best_d, best_i = d, i
+    nxt = ((route[best_i + 1], route[best_i + 2])
+           if best_i + 2 < len(route) else None)
+    return (route[best_i], route[best_i + 1]), nxt
 
 def car_time_to_crossing(road_y, crossing_x=14.0):
     """Soonest time (seconds) until any car on this road reaches the
@@ -771,14 +903,21 @@ def choose_action(state, epsilon):
 
 def q_update(state, action, reward, next_state):
     """Standard Q-learning update."""
+    if SIM_FREEZE_Q:
+        return   # evaluation run: measure the policy, don't change it
     best_next = max(q_table[next_state])
     q_table[state][action] += Q_ALPHA * (
         reward + Q_GAMMA * best_next - q_table[state][action])
 
 q_table, q_epsilon, q_run_count, q_total_crossings = load_q_table()
 q_run_count += 1
+if SIM_FREEZE_Q:
+    q_epsilon = 0.0   # greedy: act on what was learned, explore nothing
 print(f"Q-learning: run #{q_run_count}, ε={q_epsilon:.2f}, "
-      f"{q_total_crossings} crossings learned so far")
+      f"{q_total_crossings} crossings learned so far"
+      + ("  [FROZEN: greedy, no updates]" if SIM_FREEZE_Q else "")
+      + (f"  [crossing controller: {SIM_CROSSING.upper()}]"
+         if SIM_CROSSING != "q" else ""))
 bucket_labels = ["0-3m", "3-5m", "5-7m", "7-9m", "9m+"]
 
 def state_label(s):
@@ -993,6 +1132,45 @@ ideal_route = [
 
 print(f"Ideal route: {len(ideal_route)} waypoints tracing the literal road centerline.")
 
+# ---------------------------------------------------------
+# 3d. RETURN ROUTE (SIM_RETURN=1): gate bay -> depot, different roads
+# ---------------------------------------------------------
+# Deliberately shares no horizontal road and no connector with the
+# outbound leg: it leaves the bay, runs WEST along the apron midline,
+# drops down the Gate A taxiline (crossing the apron front road), runs
+# west along the service road, and comes down connector A to the
+# car-free main taxiway.
+#
+# Two of those legs run ALONG a road that carries traffic rather than
+# across it, and the robot has no overtaking behaviour. They are handled
+# differently because the geometry demands it:
+#
+#  * The 6m westward apron leg runs OFFSET to y=16.8 instead of on the
+#    y=15 centreline -- lane discipline, i.e. the robot keeps to its own
+#    side and the car passes alongside. A reservation cannot work here:
+#    at 1.4 m/s the robot needs ~4.3s to cover 6m, while the midline car
+#    sweeps a 20m range at 5 m/s, so it always catches up. Measured, that
+#    version deadlocked every episode. y=16.8 is still on the midline's
+#    4m-wide pavement, 0.75m clear of the car's footprint and 0.55m clear
+#    of the apron-back road's.
+#  * The 2m service-road leg stays on the centreline and uses a lane
+#    reservation (lane_conflict_free), which IS satisfiable there: 2.4s
+#    of traversal against a 4 m/s car on a 28m range leaves ~5.7s gaps.
+return_route = [
+    (14, 23),                  # gate bay
+    (14, APRON_RETURN_LANE),   # down past the apron back road
+    (8,  APRON_RETURN_LANE),   # WEST along the apron, offset lane
+    (8,  8),                   # down Gate A, crossing the midline + front
+    (6,  8),                   # west along the service road (shared, 2m)
+    (6,  0),                   # down connector A to the main taxiway
+    (0,  0),                   # depot
+]
+RETURN_ROUTE_COLOR = [0, 0.72, 0.83]   # cyan, distinct from the gold outbound
+
+if SIM_RETURN:
+    print(f"Return route: {len(return_route)} waypoints "
+          f"(apron midline -> Gate A connector -> service road -> connector A).")
+
 # Draw the ideal route in bold yellow, overlaid directly on top of the
 # road's dashed centerline (z=0.013, just above the dashes at z=0.012
 # so it doesn't z-fight/flicker with them). Since ideal_route is now
@@ -1007,6 +1185,16 @@ IDEAL_ROUTE_COLOR = [1, 0.85, 0]  # bold gold-yellow, solid (vs. the
                                    # road's dashed centerline) so the
                                    # two are still visually distinct
                                    # even though they overlap
+if SIM_RETURN:
+    # Draw the return route too, so both legs of the round trip are
+    # visible from the start. Slightly higher z than the gold line to
+    # avoid z-fighting where the two overlap on x=14.
+    for i in range(len(return_route) - 1):
+        p.addUserDebugLine(
+            [return_route[i][0], return_route[i][1], 0.016],
+            [return_route[i+1][0], return_route[i+1][1], 0.016],
+            lineColorRGB=RETURN_ROUTE_COLOR, lineWidth=4)
+
 for i in range(len(drawn_route) - 1):
     p.addUserDebugLine(
         [drawn_route[i][0], drawn_route[i][1], 0.013],
@@ -1075,31 +1263,56 @@ if SIM_CAPTURE:
         print(f"Map panel unavailable for capture ({exc}) -- "
               f"capturing the 3D view only.")
 
-    def render_map_panel(rx, ry, hd, signal, remaining, speed, state_name):
+    def render_map_panel(rx, ry, hd, signal, remaining, speed, state_name,
+                         fleet=None):
         """Draw one navigation-map frame and return it as an RGB array."""
         cap = capture_map
         art = cap["art"]
-        art["robot"].set_xy(navmap.robot_marker(rx, ry, hd))
+        msize = navmap.marker_size(navmap.effective_span(rx, ry, fleet))
+        for i, arrow in enumerate(art["arrows"]):
+            if fleet and i < len(fleet):
+                fx, fy, fh, fsig = fleet[i]
+                arrow.set_xy(navmap.robot_marker(fx, fy, fh, size=msize))
+                arrow.set_facecolor(navmap.GO_COLOR if fsig == "GO"
+                                    else navmap.STOP_COLOR)
+                arrow.set_visible(True)
+            elif i == 0:
+                arrow.set_xy(navmap.robot_marker(rx, ry, hd, size=msize))
+                arrow.set_facecolor(navmap.GO_COLOR if signal == "GO"
+                                    else navmap.STOP_COLOR)
+                arrow.set_visible(True)
+            else:
+                arrow.set_visible(False)
         color = navmap.GO_COLOR if signal == "GO" else navmap.STOP_COLOR
-        art["robot"].set_facecolor(color)
         art["banner"].set_text(signal)
         art["banner"].get_bbox_patch().set_facecolor(color)
 
-        tx, ty = cap["trail_x"], cap["trail_y"]
-        if not tx or math.hypot(rx - tx[-1], ry - ty[-1]) > 0.12:
-            tx.append(rx)
-            ty.append(ry)
-            art["trail"].set_data(tx, ty)
+        # One trail per robot, coloured and layered by nav_map (robot-1
+        # red, robot-2 blue, newer on top). The single legacy trail is
+        # left empty: feeding it as well drew robot-1's path twice, in
+        # red, over the top of robot-2's blue.
+        paths = cap.setdefault("fleet_trails", [])
+        for i, (fx, fy, _fh, _fs) in enumerate(fleet or [(rx, ry, hd, signal)]):
+            while len(paths) <= i:
+                paths.append(([], []))
+            xs, ys = paths[i]
+            if not xs or math.hypot(fx - xs[-1], fy - ys[-1]) > 0.12:
+                xs.append(fx)
+                ys.append(fy)
+                if i < len(art["trails"]):
+                    art["trails"][i].set_data(xs, ys)
+                    art["trails"][i].set_visible(True)
+                    navmap.raise_trail(art["trails"][i])
 
         for patch, car in zip(art["cars"], cars):
             patch.set_xy((car["x"] - 0.8, car["y"] - 0.35))
 
         eta = f"{remaining / speed:.0f}s" if speed > 0.25 else "--"
         art["readout"].set_text(
-            f"{remaining:5.1f} m to gate     ETA {eta}     "
+            f"{remaining:5.1f} m to go     ETA {eta}     "
             f"{speed:4.1f} m/s     {state_name}")
 
-        navmap.apply_view(cap["ax"], rx, ry)
+        navmap.apply_view(cap["ax"], rx, ry, fleet)
         cap["fig"].canvas.draw()
         return np.asarray(cap["fig"].canvas.buffer_rgba())[:, :, :3]
 
@@ -1173,6 +1386,17 @@ def start_nav_map():
         print(f"Navigation map unavailable ({exc}) -- continuing without it.")
         map_proc = None
 
+def fleet_poses():
+    """[x, y, heading, signal] for every robot, for the map and the
+    capture panel. Queried on demand at viewer rate, not per frame."""
+    out = []
+    for o in robots:
+        (ox, oy, _), oorn = p.getBasePositionAndOrientation(o.body)
+        out.append([round(ox, 3), round(oy, 3),
+                    round(p.getEulerFromQuaternion(oorn)[2], 3),
+                    o.shown_signal])
+    return out
+
 def send_to_map(payload):
     """Non-blocking write; drops the update rather than stalling the
     sim if the pipe is full, and disables the map if it has closed."""
@@ -1187,18 +1411,17 @@ def send_to_map(payload):
     except (BrokenPipeError, ValueError, OSError):
         map_proc = None   # window closed; carry on without it
 
-def update_signal_light(signal, robot_pos):
+def update_signal_light(r, signal, robot_pos):
     """Keep the light riding above the robot; recolor on signal change."""
-    global light_shown_signal
     p.resetBasePositionAndOrientation(
-        signal_light_id,
+        r.signal_light_id,
         [robot_pos[0], robot_pos[1], robot_pos[2] + SIGNAL_LIGHT_HEIGHT],
         p.getQuaternionFromEuler([0, 0, 0]))
-    if signal != light_shown_signal:
-        p.changeVisualShape(signal_light_id, -1,
+    if signal != r.light_shown_signal:
+        p.changeVisualShape(r.signal_light_id, -1,
                             rgbaColor=(SIGNAL_GO_COLOR if signal == "GO"
                                        else SIGNAL_STOP_COLOR))
-        light_shown_signal = signal
+        r.light_shown_signal = signal
 
 # ---------------------------------------------------------
 # 4. DRIVE THE ROBOT ALONG THE WAYPOINTS
@@ -1341,8 +1564,9 @@ def lookahead_point_on_route(route, current_world, lookahead_distance):
 
     return target[0], target[1], remaining
 
-def find_rejoin_target(current_world, search_step=0.3, max_search_distance=15.0):
-    """Starting from the point on `ideal_route` nearest the robot's
+def find_rejoin_target(active_route, current_world, search_step=0.3,
+                       max_search_distance=15.0):
+    """Starting from the point on the ACTIVE route nearest the robot's
     current (post-reverse) position, walk forward in small steps along
     the route's own literal geometry, and return the first point that's
     clear of every cell in `runtime_blocked` -- this is what lets the
@@ -1357,9 +1581,9 @@ def find_rejoin_target(current_world, search_step=0.3, max_search_distance=15.0)
     # the segment's start corner instead of from where the robot
     # actually is).
     best_idx, best_t, best_dist = 0, 0.0, float("inf")
-    for i in range(len(ideal_route) - 1):
-        x1, y1 = ideal_route[i]
-        x2, y2 = ideal_route[i + 1]
+    for i in range(len(active_route) - 1):
+        x1, y1 = active_route[i]
+        x2, y2 = active_route[i + 1]
         seg_dx, seg_dy = x2 - x1, y2 - y1
         seg_len_sq = seg_dx ** 2 + seg_dy ** 2
         if seg_len_sq == 0:
@@ -1375,11 +1599,11 @@ def find_rejoin_target(current_world, search_step=0.3, max_search_distance=15.0)
     # partial distance into segment best_idx itself.
     start_offset = 0.0
     for i in range(best_idx):
-        x1, y1 = ideal_route[i]
-        x2, y2 = ideal_route[i + 1]
+        x1, y1 = active_route[i]
+        x2, y2 = active_route[i + 1]
         start_offset += math.hypot(x2 - x1, y2 - y1)
-    x1, y1 = ideal_route[best_idx]
-    x2, y2 = ideal_route[best_idx + 1]
+    x1, y1 = active_route[best_idx]
+    x2, y2 = active_route[best_idx + 1]
     seg_len = math.hypot(x2 - x1, y2 - y1)
     start_offset += seg_len * best_t
 
@@ -1387,7 +1611,7 @@ def find_rejoin_target(current_world, search_step=0.3, max_search_distance=15.0)
     traveled = 0.0
     found_blocked = False
     while traveled <= max_search_distance:
-        point, _ = point_at_distance_along_route(ideal_route, 0, start_offset + traveled)
+        point, _ = point_at_distance_along_route(active_route, 0, start_offset + traveled)
         pgx, pgy = world_to_grid(point[0], point[1])
         if (pgx, pgy) in runtime_blocked:
             found_blocked = True
@@ -1395,15 +1619,15 @@ def find_rejoin_target(current_world, search_step=0.3, max_search_distance=15.0)
         traveled += search_step
 
     if not found_blocked:
-        point, _ = point_at_distance_along_route(ideal_route, 0, start_offset)
+        point, _ = point_at_distance_along_route(active_route, 0, start_offset)
         return point
 
     while traveled <= max_search_distance:
-        point, _ = point_at_distance_along_route(ideal_route, 0, start_offset + traveled)
+        point, _ = point_at_distance_along_route(active_route, 0, start_offset + traveled)
         pgx, pgy = world_to_grid(point[0], point[1])
         if (pgx, pgy) not in runtime_blocked:
             rejoin_point, _ = point_at_distance_along_route(
-                ideal_route, 0, start_offset + traveled + CLEARANCE_MARGIN)
+                active_route, 0, start_offset + traveled + CLEARANCE_MARGIN)
             return rejoin_point
         traveled += search_step
 
@@ -1470,13 +1694,104 @@ episode_collisions = 0
 episode_near_misses = 0
 episode_go_decisions = 0
 episode_wait_decisions = 0
+# Seconds the robot spent held at the service-road crossing. Measured
+# from the commanded signal and position, not from any policy's
+# internals, so the Q-agent and the rule baseline are scored the same
+# way -- this is the headline number in the A/B comparison.
+episode_crossing_hold = 0.0
 
 if SIM_MAP:
     start_nav_map()
 
+# ---- Fleet ----
+# Every piece of mutable state the control logic touches lives on a
+# Robot, so one body of logic can drive any number of them.
+# `active_route` is what pure pursuit and the detour planner follow;
+# with SIM_RETURN it is swapped for return_route at the gate.
+LEG_OUTBOUND = "OUTBOUND"
+LEG_RETURN = "RETURN"
+
+class Robot:
+    _spawned = 0
+
+    def __init__(self, name, body, route, trail_color, do_return=False):
+        self.name, self.body = name, body
+        self.active_route = route
+        self.do_return = do_return
+        self.leg = LEG_OUTBOUND
+        self.state = STATE_DRIVING
+        self.drive_signal = self.shown_signal = "GO"
+        self.finished = False
+        self.target_reached = False
+        self.gate_time = None
+        # collision recovery
+        self.reverse_start_pos = None
+        self.detour_waypoints = []
+        self.detour_index = 0
+        self.active_divert_cone_id = None
+        self.diverted_cone_ids = set()
+        self.last_collision_time = {}
+        # Q-crossing latches are per robot so two robots crossing cannot
+        # corrupt each other's pending decision. The Q-TABLE stays
+        # shared -- both robots learn into the same policy.
+        self.q_go_active = False
+        self.q_go_min_dist = float("inf")
+        self.q_crossing_done = False
+        self.q_current_state = None
+        self.q_current_action = None
+        self.q_wait_cost = 0.0
+        self.wait_start_time = None
+        # per-robot metrics
+        self.episode_collisions = 0
+        self.episode_near_misses = 0
+        self.episode_go_decisions = 0
+        self.episode_wait_decisions = 0
+        self.episode_crossing_hold = 0.0
+        # viewer state
+        self.trail_color = trail_color
+        # Breadcrumb height: a fixed, well-separated value per robot, the
+        # EARLIER robot higher so its trail reads on top.
+        #
+        # Per-segment recency ordering was tried and reverted. It needs
+        # interleaved heights a fraction of a millimetre apart, which the
+        # depth buffer cannot resolve at this camera distance, so
+        # overlapping red and blue segments flickered as they contested
+        # the same pixels. 2cm apart never fights. (The 2D map has no
+        # depth buffer, so it keeps true recency ordering.)
+        self.trail_ids = []        # debug-line ids of the current leg
+        self.trail_disc_ids = []   # capture-mode disc bodies, same leg
+        self.last_capture_marker = tuple(route[0])
+        self.trail_z = 0.09 - 0.02 * Robot._spawned
+        Robot._spawned += 1
+        self.last_trail_pos = tuple(route[0])
+        vis = p.createVisualShape(p.GEOM_SPHERE, radius=0.25,
+                                  rgbaColor=SIGNAL_GO_COLOR)
+        self.signal_light_id = p.createMultiBody(
+            0, -1, vis,
+            basePosition=[route[0][0], route[0][1], SIGNAL_LIGHT_HEIGHT])
+        self.light_shown_signal = "GO"
+
+ROBOT2_TRAIL_COLOR = [0.15, 0.4, 1.0]   # blue, distinct from robot-1's red
+
+def spawn_robot(name, route, trail_color, do_return=False):
+    """Put another husky on the tarmac at its route's first waypoint."""
+    x, y = route[0]
+    body = p.loadURDF("husky/husky.urdf", [x, y, 0.1])
+    for j in WHEEL_JOINTS:
+        p.setJointMotorControl2(body, j, p.VELOCITY_CONTROL,
+                                targetVelocity=0, force=15)
+    return Robot(name, body, route, trail_color, do_return)
+
+robots = [Robot("robot-1", robot, ideal_route, DRIVEN_TRAIL_COLOR,
+                do_return=SIM_RETURN)]
+pending_robots = []
+
+loop_start_wall = time.perf_counter()
 print("Driving along planned path...")
 sim_time = 0.0
 map_frame_count = 0
+frame_index = 0
+UI_POLL_EVERY = 8   # 480Hz / 8 = 60Hz for viewer-facing updates
 
 while True:
     if not p.isConnected():
@@ -1487,10 +1802,16 @@ while True:
     # lands mid-frame, so the physics calls are guarded: closing the
     # GUI should end the run tidily (and still write the summary and
     # Q-table below) rather than raising out of the loop.
+    frame_index += 1
     try:
         p.stepSimulation()
         if not SIM_HEADLESS:
-            update_camera_from_keys()
+            # Camera/keyboard polling is two server round trips; at 480Hz
+            # that is 960 a second for input a human cannot perceive
+            # faster than ~60Hz. Throttling it is most of the difference
+            # between the GUI crawling and running near real time.
+            if frame_index % UI_POLL_EVERY == 0:
+                update_camera_from_keys()
             time.sleep(1. / 480.)
         sim_time += 1. / 480.
 
@@ -1509,425 +1830,605 @@ while True:
         print("Simulation window was closed -- exiting.")
         break
 
-    # Keep the GO/STOP light riding above the robot. It shows the
-    # signal computed by the previous frame's control logic (a 1-frame
-    # lag at 480 Hz -- imperceptible).
-    update_signal_light(drive_signal, pos)
+    # ---- Per-robot control ----
+    # Iterating rather than extracting a function keeps every
+    # `continue` below meaning exactly what it meant as a
+    # single-robot loop: skip the rest of THIS robot's frame.
+    try:
+        for r in robots:
+            if r.finished:
+                continue
+            pos, orn = p.getBasePositionAndOrientation(r.body)
+            euler = p.getEulerFromQuaternion(orn)
+            heading = euler[2]
 
-    # Feed the 2D navigation map window.
-    if map_proc is not None:
-        map_frame_count += 1
-        if map_frame_count % MAP_UPDATE_EVERY == 0:
-            _, _, map_remaining = lookahead_point_on_route(
-                ideal_route, (pos[0], pos[1]), LOOKAHEAD_DISTANCE)
-            vel, _ = p.getBaseVelocity(robot)
-            send_to_map({
-                "type": "state",
-                "t": round(sim_time, 2),
-                "robot": [round(pos[0], 3), round(pos[1], 3),
-                          round(heading, 3)],
-                "signal": drive_signal,
-                "state": state,
-                "cars": [[round(c["x"], 2), round(c["y"], 2)] for c in cars],
-                "remaining": round(map_remaining, 2),
-                "speed": round(math.hypot(vel[0], vel[1]), 2),
-            })
+            # Keep the GO/STOP light riding above the robot. It shows the
+            # signal computed by the previous frame's control logic (a 1-frame
+            # lag at 480 Hz -- imperceptible).
+            if SIM_HEADLESS or frame_index % UI_POLL_EVERY == 0:
+                update_signal_light(r, r.drive_signal, pos)
 
-    # The control logic below recomputes drive_signal for THIS frame,
-    # so the settled value from the previous frame is kept for the
-    # visual overlays (signal light, map panel, GIF). Without this the
-    # capture below would read the freshly-reset "GO" every time and
-    # never record a STOP.
-    shown_signal = drive_signal
+            # Feed the 2D navigation map window.
+            if map_proc is not None and r is robots[0]:
+                map_frame_count += 1
+                if map_frame_count % MAP_UPDATE_EVERY == 0:
+                    _, _, map_remaining = lookahead_point_on_route(
+                        r.active_route, (pos[0], pos[1]), LOOKAHEAD_DISTANCE)
+                    vel, _ = p.getBaseVelocity(r.body)
+                    send_to_map({
+                        "type": "state",
+                        "t": round(sim_time, 2),
+                        "robot": [round(pos[0], 3), round(pos[1], 3),
+                                  round(heading, 3)],
+                        "signal": r.drive_signal,
+                        "state": r.state,
+                        "cars": [[round(c["x"], 2), round(c["y"], 2)] for c in cars],
+                        "remaining": round(map_remaining, 2),
+                        "speed": round(math.hypot(vel[0], vel[1]), 2),
+                    })
 
-    # Default drive signal for this frame; any branch below that
-    # commands the wheels to hold overrides it to STOP.
-    drive_signal = "GO"
+            # The control logic below recomputes drive_signal for THIS frame,
+            # so the settled value from the previous frame is kept for the
+            # visual overlays (signal light, map panel, GIF). Without this the
+            # capture below would read the freshly-reset "GO" every time and
+            # never record a STOP.
+            r.shown_signal = r.drive_signal
 
-    # ---- Offscreen GIF capture (placed before any `continue` so
-    # frames keep flowing while the robot holds at a crossing) ----
-    if SIM_CAPTURE:
-        # Driven-path markers stand in for the red debug-line trail.
-        if math.hypot(pos[0] - last_capture_marker[0],
-                      pos[1] - last_capture_marker[1]) > 0.4:
-            disc = p.createVisualShape(p.GEOM_CYLINDER, radius=0.09,
-                                       length=0.02, rgbaColor=[1, 0, 0, 1])
-            p.createMultiBody(0, -1, disc,
-                              basePosition=[pos[0], pos[1], 0.03])
-            last_capture_marker = (pos[0], pos[1])
-        if sim_time >= next_capture_time:
-            next_capture_time += 1.0 / CAPTURE_FPS
-            _, _, rgb, _, _ = p.getCameraImage(
-                CAPTURE_SIZE[0], CAPTURE_SIZE[1],
-                CAPTURE_VIEW, CAPTURE_PROJ,
-                renderer=p.ER_TINY_RENDERER)
-            # Defensive copy: PyBullet doesn't guarantee ownership of
-            # the returned pixel buffer across getCameraImage calls.
-            panel_3d = np.reshape(np.array(rgb, dtype=np.uint8, copy=True),
-                                  (CAPTURE_SIZE[1], CAPTURE_SIZE[0], 4))[:, :, :3]
+            # Policy-agnostic crossing delay: count time held anywhere in the
+            # approach to the service road, whoever decided to hold.
+            if (r.shown_signal == "STOP"
+                    and abs(pos[0] - Q_CROSSING_X) < Q_CROSSING_X_TOL
+                    and Q_CROSSING_Y - 3.0 < pos[1] < Q_CROSSING_Y + 1.0):
+                r.episode_crossing_hold += 1. / 480.
 
-            if capture_map is not None:
-                _, _, cap_remaining = lookahead_point_on_route(
-                    ideal_route, (pos[0], pos[1]), LOOKAHEAD_DISTANCE)
-                cap_vel, _ = p.getBaseVelocity(robot)
-                panel_map = render_map_panel(
-                    pos[0], pos[1], heading, shown_signal, cap_remaining,
-                    math.hypot(cap_vel[0], cap_vel[1]), state)
-                divider = np.full((CAPTURE_SIZE[1], 3, 3), 210, dtype=np.uint8)
-                capture_frames.append(
-                    np.hstack([panel_3d, divider, panel_map]))
-            else:
-                capture_frames.append(panel_3d)
+            # Default drive signal for this frame; any branch below that
+            # commands the wheels to hold overrides it to STOP.
+            r.drive_signal = "GO"
 
-    # ---- Q-learning: gap acceptance at the service-road crossing ----
-    # When the robot is climbing connector B and nears the service
-    # road (x=14, y=8), it must decide: WAIT or GO? The Q-learning
-    # agent makes this decision based on the current gap to the
-    # nearest service-road car, using its learned Q-values.
-    at_crossing = (state in (STATE_DRIVING, STATE_WAITING) and
-                   abs(pos[0] - Q_CROSSING_X) < Q_CROSSING_X_TOL and
-                   Q_CROSSING_Y - Q_CROSSING_APPROACH
-                   < pos[1] <
-                   Q_CROSSING_Y + Q_CROSSING_CLEAR)
+            # ---- Offscreen GIF capture (placed before any `continue` so
+            # frames keep flowing while the robot holds at a crossing) ----
+            if SIM_CAPTURE:
+                # Debug lines do not render offscreen, so the captured 3D
+                # trail is a line of small discs instead. One per robot in
+                # that robot's own colour, and their body ids are tracked
+                # so a finished leg's trail can be removed -- clearing the
+                # debug lines alone left the old trail in the recording.
+                if math.hypot(pos[0] - r.last_capture_marker[0],
+                              pos[1] - r.last_capture_marker[1]) > 0.4:
+                    disc = p.createVisualShape(
+                        p.GEOM_CYLINDER, radius=0.09, length=0.02,
+                        rgbaColor=list(r.trail_color) + [1])
+                    r.trail_disc_ids.append(p.createMultiBody(
+                        0, -1, disc,
+                        basePosition=[pos[0], pos[1], 0.03 + r.trail_z * 0.1]))
+                    r.last_capture_marker = (pos[0], pos[1])
+            if SIM_CAPTURE and r is robots[0]:
+                if sim_time >= next_capture_time:
+                    next_capture_time += 1.0 / CAPTURE_FPS
+                    _, _, rgb, _, _ = p.getCameraImage(
+                        CAPTURE_SIZE[0], CAPTURE_SIZE[1],
+                        CAPTURE_VIEW, CAPTURE_PROJ,
+                        renderer=p.ER_TINY_RENDERER)
+                    # Defensive copy: PyBullet doesn't guarantee ownership of
+                    # the returned pixel buffer across getCameraImage calls.
+                    panel_3d = np.reshape(np.array(rgb, dtype=np.uint8, copy=True),
+                                          (CAPTURE_SIZE[1], CAPTURE_SIZE[0], 4))[:, :, :3]
 
-    if not at_crossing:
-        if q_go_active:
-            # The robot has cleared the crossing zone on a committed GO
-            # -- resolve the reward now, based on what actually happened
-            # while crossing (closest approach of any taxiway car), not
-            # on the gap at the moment the decision was made.
-            safe = q_go_min_dist >= NEAR_MISS_DISTANCE
-            if not safe:
-                episode_near_misses += 1
-            reward = 10.0 if safe else -10.0
-            next_state = q_state(*crossing_gap_and_direction())
-            q_update(q_current_state, ACTION_GO, reward, next_state)
-            q_total_crossings += 1
-            save_q_table(q_table, q_epsilon, q_run_count, q_total_crossings)
-            print(f"Q-agent: crossing complete -- closest car "
-                  f"{q_go_min_dist:.1f}m -> {'safe' if safe else 'NEAR MISS'}  "
-                  f"reward={reward:+.0f}  "
-                  f"Q[{state_label(q_current_state)}, GO]="
-                  f"{q_table[q_current_state][ACTION_GO]:+.2f}")
-            q_go_active = False
-        # Out of the zone -- the next approach gets a fresh decision.
-        q_crossing_done = False
+                    if capture_map is not None:
+                        _, _, cap_remaining = lookahead_point_on_route(
+                            r.active_route, (pos[0], pos[1]), LOOKAHEAD_DISTANCE)
+                        cap_vel, _ = p.getBaseVelocity(r.body)
+                        panel_map = render_map_panel(
+                            pos[0], pos[1], heading, r.shown_signal, cap_remaining,
+                            math.hypot(cap_vel[0], cap_vel[1]), r.state,
+                            fleet=fleet_poses())
+                        divider = np.full((CAPTURE_SIZE[1], 3, 3), 210, dtype=np.uint8)
+                        capture_frames.append(
+                            np.hstack([panel_3d, divider, panel_map]))
+                    else:
+                        capture_frames.append(panel_3d)
 
-    if at_crossing:
-        if q_go_active:
-            # Mid-crossing on a committed GO: keep tracking how close
-            # the traffic actually gets, but don't make a new decision.
-            q_go_min_dist = min(q_go_min_dist,
-                                nearest_crossing_car_distance(pos[0], pos[1]))
-        elif q_crossing_done:
-            pass  # decision already resolved for this approach -- just drive
-        else:
-            gap, car_approaching = crossing_gap_and_direction()
+            # ---- Q-learning: gap acceptance at the service-road crossing ----
+            # When the robot is climbing connector B and nears the service
+            # road (x=14, y=8), it must decide: WAIT or GO? The Q-learning
+            # agent makes this decision based on the current gap to the
+            # nearest service-road car, using its learned Q-values.
+            at_crossing = (SIM_CROSSING == "q" and
+                           r.state in (STATE_DRIVING, STATE_WAITING) and
+                           abs(pos[0] - Q_CROSSING_X) < Q_CROSSING_X_TOL and
+                           Q_CROSSING_Y - Q_CROSSING_APPROACH
+                           < pos[1] <
+                           Q_CROSSING_Y + Q_CROSSING_CLEAR)
 
-            # Only engage the Q-agent when a car is actually close enough
-            # to matter. If road is clear beyond the largest gap bucket
-            # (9m+), just drive through with no decision needed.
-            if gap >= GAP_BUCKETS[-1]:
-                if state == STATE_WAITING:
-                    state = STATE_DRIVING
-                # fall through to normal driving below
-            elif state == STATE_DRIVING:
-                # Arriving at the crossing -- make ONE GO/WAIT decision
-                # for this approach. The q_go_active / q_crossing_done
-                # latches stop it being re-made every frame while the
-                # robot is still inside the zone.
-                current_state = q_state(gap, car_approaching)
-                action = choose_action(current_state, q_epsilon)
-                q_current_state = current_state
-                q_current_action = action
-                q_wait_cost = 0.0
-
-                if action == ACTION_WAIT:
-                    episode_wait_decisions += 1
-                    state = STATE_WAITING
-                    wait_start_time = sim_time
-                    drive_signal = "STOP"
-                    print(f"Q-agent: GAP={gap:.1f}m "
-                          f"{'closing' if car_approaching else 'receding'} "
-                          f"({state_label(current_state)}) "
-                          f"-> WAIT  [ε={q_epsilon:.2f}]")
-                    for joint in WHEEL_JOINTS:
-                        p.setJointMotorControl2(robot, joint, p.VELOCITY_CONTROL,
-                                                 targetVelocity=0, force=15)
-                    continue
-                else:
-                    # GO -- commit to the crossing. The reward is NOT
-                    # applied yet: it resolves when the robot clears the
-                    # zone, based on the closest a car actually came.
-                    episode_go_decisions += 1
-                    q_go_active = True
-                    q_go_min_dist = nearest_crossing_car_distance(pos[0], pos[1])
-                    print(f"Q-agent: GAP={gap:.1f}m "
-                          f"{'closing' if car_approaching else 'receding'} "
-                          f"({state_label(current_state)}) "
-                          f"-> GO  [ε={q_epsilon:.2f}]")
-
-            elif state == STATE_WAITING:
-                # Accumulate waiting cost (small penalty per second)
-                q_wait_cost += 1.0 * (1. / 480.)
-
-                # Release the wait using the same predicted-time check
-                # as the rule-based crossings: a raw distance threshold
-                # is direction-blind, and stepping out on a "7m gap"
-                # in front of a fast APPROACHING car is exactly the
-                # near-miss the wait was supposed to prevent. (This
-                # also releases early behind a car that just passed
-                # and is receding -- gap tiny, but perfectly safe.)
-                eta = car_time_to_crossing(Q_CROSSING_Y, Q_CROSSING_X)
-                if eta >= MIN_CROSSING_TIME:
-                    reward = 10.0 - q_wait_cost
+            if not at_crossing:
+                if r.q_go_active:
+                    # The robot has cleared the crossing zone on a committed GO
+                    # -- resolve the reward now, based on what actually happened
+                    # while crossing (closest approach of any taxiway car), not
+                    # on the gap at the moment the decision was made.
+                    safe = r.q_go_min_dist >= NEAR_MISS_DISTANCE
+                    if not safe:
+                        r.episode_near_misses += 1
+                    reward = 10.0 if safe else -10.0
                     next_state = q_state(*crossing_gap_and_direction())
-                    q_update(q_current_state, ACTION_WAIT, reward, next_state)
+                    q_update(r.q_current_state, ACTION_GO, reward, next_state)
                     q_total_crossings += 1
                     save_q_table(q_table, q_epsilon, q_run_count, q_total_crossings)
-                    print(f"Q-agent: road clear (next car {eta:.1f}s out) "
-                          f"after {sim_time - wait_start_time:.1f}s wait -- "
-                          f"crossing. reward={reward:+.1f}  "
-                          f"Q[WAIT]={q_table[q_current_state][ACTION_WAIT]:+.2f}")
-                    state = STATE_DRIVING
-                    # The wait decision is resolved -- cross now without
-                    # re-deciding on every remaining frame in the zone.
-                    q_crossing_done = True
+                    print(f"Q-agent: crossing complete -- closest car "
+                          f"{r.q_go_min_dist:.1f}m -> {'safe' if safe else 'NEAR MISS'}  "
+                          f"{'reward n/a (frozen)  ' if SIM_FREEZE_Q else f'reward={reward:+.0f}  '}"
+                          f"Q[{state_label(r.q_current_state)}, GO]="
+                          f"{q_table[r.q_current_state][ACTION_GO]:+.2f}")
+                    r.q_go_active = False
+                # Out of the zone -- the next approach gets a fresh decision.
+                r.q_crossing_done = False
+
+            if at_crossing:
+                if r.q_go_active:
+                    # Mid-crossing on a committed GO: keep tracking how close
+                    # the traffic actually gets, but don't make a new decision.
+                    r.q_go_min_dist = min(r.q_go_min_dist,
+                                        nearest_crossing_car_distance(pos[0], pos[1]))
+                elif r.q_crossing_done:
+                    pass  # decision already resolved for this approach -- just drive
                 else:
-                    drive_signal = "STOP"
-                    for joint in WHEEL_JOINTS:
-                        p.setJointMotorControl2(robot, joint, p.VELOCITY_CONTROL,
-                                                 targetVelocity=0, force=15)
+                    gap, car_approaching = crossing_gap_and_direction()
+
+                    # Only engage the Q-agent when a car is actually close enough
+                    # to matter. If road is clear beyond the largest gap bucket
+                    # (9m+), just drive through with no decision needed.
+                    if gap >= GAP_BUCKETS[-1]:
+                        if r.state == STATE_WAITING:
+                            r.state = STATE_DRIVING
+                        # fall through to normal driving below
+                    elif r.state == STATE_DRIVING:
+                        # Arriving at the crossing -- make ONE GO/WAIT decision
+                        # for this approach. The q_go_active / q_crossing_done
+                        # latches stop it being re-made every frame while the
+                        # robot is still inside the zone.
+                        current_state = q_state(gap, car_approaching)
+                        action = choose_action(current_state, q_epsilon)
+                        r.q_current_state = current_state
+                        r.q_current_action = action
+                        r.q_wait_cost = 0.0
+
+                        if action == ACTION_WAIT:
+                            r.episode_wait_decisions += 1
+                            r.state = STATE_WAITING
+                            r.wait_start_time = sim_time
+                            r.drive_signal = "STOP"
+                            print(f"Q-agent: GAP={gap:.1f}m "
+                                  f"{'closing' if car_approaching else 'receding'} "
+                                  f"({state_label(current_state)}) "
+                                  f"-> WAIT  [ε={q_epsilon:.2f}]")
+                            for joint in WHEEL_JOINTS:
+                                p.setJointMotorControl2(r.body, joint, p.VELOCITY_CONTROL,
+                                                         targetVelocity=0, force=15)
+                            continue
+                        else:
+                            # GO -- commit to the crossing. The reward is NOT
+                            # applied yet: it resolves when the robot clears the
+                            # zone, based on the closest a car actually came.
+                            r.episode_go_decisions += 1
+                            r.q_go_active = True
+                            r.q_go_min_dist = nearest_crossing_car_distance(pos[0], pos[1])
+                            print(f"Q-agent: GAP={gap:.1f}m "
+                                  f"{'closing' if car_approaching else 'receding'} "
+                                  f"({state_label(current_state)}) "
+                                  f"-> GO  [ε={q_epsilon:.2f}]")
+
+                    elif r.state == STATE_WAITING:
+                        # Accumulate waiting cost (small penalty per second)
+                        r.q_wait_cost += 1.0 * (1. / 480.)
+
+                        # Release the wait using the same predicted-time check
+                        # as the rule-based crossings: a raw distance threshold
+                        # is direction-blind, and stepping out on a "7m gap"
+                        # in front of a fast APPROACHING car is exactly the
+                        # near-miss the wait was supposed to prevent. (This
+                        # also releases early behind a car that just passed
+                        # and is receding -- gap tiny, but perfectly safe.)
+                        eta = car_time_to_crossing(Q_CROSSING_Y, Q_CROSSING_X)
+                        if eta >= MIN_CROSSING_TIME:
+                            reward = 10.0 - r.q_wait_cost
+                            next_state = q_state(*crossing_gap_and_direction())
+                            q_update(r.q_current_state, ACTION_WAIT, reward, next_state)
+                            q_total_crossings += 1
+                            save_q_table(q_table, q_epsilon, q_run_count, q_total_crossings)
+                            print(f"Q-agent: road clear (next car {eta:.1f}s out) "
+                                  f"after {sim_time - r.wait_start_time:.1f}s wait -- "
+                                  f"crossing. "
+                                  f"{'reward n/a (frozen)  ' if SIM_FREEZE_Q else f'reward={reward:+.1f}  '}"
+                                  f"Q[WAIT]={q_table[r.q_current_state][ACTION_WAIT]:+.2f}")
+                            r.state = STATE_DRIVING
+                            # The wait decision is resolved -- cross now without
+                            # re-deciding on every remaining frame in the zone.
+                            r.q_crossing_done = True
+                        else:
+                            r.drive_signal = "STOP"
+                            for joint in WHEEL_JOINTS:
+                                p.setJointMotorControl2(r.body, joint, p.VELOCITY_CONTROL,
+                                                         targetVelocity=0, force=15)
+                            continue
+
+            # ---- Rule-based crossing safety at road crossings ----
+            # Only check the single next upcoming road -- whichever road's
+            # y-coordinate is immediately above the robot's current y.
+            # Each road has a tight hold window that ends BEFORE the car's
+            # lane: [road.y - STOP_MARGIN, road.y - COMMIT_MARGIN]. Once the
+            # robot is closer than COMMIT_MARGIN it is committed to the
+            # crossing and never told to stop in the lane. Windows don't
+            # overlap, so the robot can never be blocked by two roads at once.
+            # This guard also runs while REJOINING: a collision detour crosses
+            # the same roads as normal driving, and skipping the check there
+            # let cars hit the robot mid-detour. In that state the service
+            # road (normally the Q-agent's crossing) is guarded too.
+            if r.state in (STATE_DRIVING, STATE_REJOINING):
+                blocked_by_car = False
+                # In the "rule" A/B arm the service road is guarded here too,
+                # replacing the Q-agent with the same predictive threshold the
+                # apron roads use -- that is the hand-written baseline.
+                if r.state == STATE_REJOINING or SIM_CROSSING == "rule":
+                    roads_to_check = REJOIN_CROSSING_ROADS
+                else:
+                    roads_to_check = CROSSING_ROADS
+                # Which way along the route is the robot heading? The outbound
+                # leg climbs, the return leg descends, so the hold window has to
+                # sit on the side the robot is approaching from -- a fixed
+                # "below the road" window would put the return leg's hold point
+                # past the road it is meant to guard.
+                cur_seg, next_seg = route_leg_at(r.active_route, pos[0], pos[1])
+                going_up = (cur_seg[1][1] - cur_seg[0][1]) >= 0
+
+                # A road the route runs ALONG is not a crossing: it needs a lane
+                # reservation instead, checked once on the vertical approach.
+                travelling_along_y = (cur_seg[0][1] if
+                                      abs(cur_seg[0][1] - cur_seg[1][1]) < 0.1
+                                      else None)
+
+                # A robot moving sideways is not crossing any horizontal road, so
+                # the crossing windows don't apply. Without this the offset apron
+                # leg (y=16.8) sits permanently inside the y=15 approach window
+                # and stalls every time the midline car comes near.
+                for road in (() if travelling_along_y is not None
+                             else roads_to_check):
+                    if going_up:
+                        in_zone = (road["y"] - CROSSING_STOP_MARGIN
+                                   < pos[1]
+                                   < road["y"] - CROSSING_COMMIT_MARGIN)
+                    else:
+                        in_zone = (road["y"] + CROSSING_DOWN_COMMIT_MARGIN
+                                   < pos[1]
+                                   < road["y"] + CROSSING_DOWN_STOP_MARGIN)
+                    if in_zone:
+                        # Cross where the robot actually is, not at a fixed x --
+                        # the return leg crosses the apron front at x=8.
+                        eta = car_time_to_crossing(road["y"], pos[0])
+                        if eta < MIN_CROSSING_TIME:
+                            blocked_by_car = True
+                            r.drive_signal = "STOP"
+                            for joint in WHEEL_JOINTS:
+                                p.setJointMotorControl2(r.body, joint, p.VELOCITY_CONTROL,
+                                                         targetVelocity=0, force=15)
+                        break  # only ever check the first road we're in range of
+
+                # ---- Lane reservation before entering a shared lane ----
+                # If the next leg runs along a road that carries traffic, hold
+                # on the approach (clear of the lane) until the whole traversal
+                # can be made without meeting a car.
+                if not blocked_by_car and next_seg is not None:
+                    nx1, ny1 = next_seg[0]
+                    nx2, ny2 = next_seg[1]
+                    if abs(ny1 - ny2) < 0.1 and ny1 in TRAFFIC_ROAD_YS:
+                        approaching = (LANE_ENTRY_STANDOFF_MIN
+                                       < abs(pos[1] - ny1)
+                                       < LANE_ENTRY_STANDOFF_MAX)
+                        if approaching and not lane_conflict_free(ny1, nx1, nx2):
+                            blocked_by_car = True
+                            r.drive_signal = "STOP"
+                            for joint in WHEEL_JOINTS:
+                                p.setJointMotorControl2(r.body, joint, p.VELOCITY_CONTROL,
+                                                         targetVelocity=0, force=15)
+
+                if blocked_by_car:
                     continue
 
-    # ---- Rule-based crossing safety at road crossings ----
-    # Only check the single next upcoming road -- whichever road's
-    # y-coordinate is immediately above the robot's current y.
-    # Each road has a tight hold window that ends BEFORE the car's
-    # lane: [road.y - STOP_MARGIN, road.y - COMMIT_MARGIN]. Once the
-    # robot is closer than COMMIT_MARGIN it is committed to the
-    # crossing and never told to stop in the lane. Windows don't
-    # overlap, so the robot can never be blocked by two roads at once.
-    # This guard also runs while REJOINING: a collision detour crosses
-    # the same roads as normal driving, and skipping the check there
-    # let cars hit the robot mid-detour. In that state the service
-    # road (normally the Q-agent's crossing) is guarded too.
-    if state in (STATE_DRIVING, STATE_REJOINING):
-        blocked_by_car = False
-        roads_to_check = (CROSSING_ROADS if state == STATE_DRIVING
-                          else REJOIN_CROSSING_ROADS)
-        for road in roads_to_check:
-            in_zone = (road["y"] - CROSSING_STOP_MARGIN
-                       < pos[1]
-                       < road["y"] - CROSSING_COMMIT_MARGIN)
-            if in_zone:
-                eta = car_time_to_crossing(road["y"], CROSSING_X)
-                if eta < MIN_CROSSING_TIME:
-                    blocked_by_car = True
-                    drive_signal = "STOP"
+
+            if math.hypot(pos[0] - r.last_trail_pos[0], pos[1] - r.last_trail_pos[1]) > 0.03:
+                r.trail_ids.append(p.addUserDebugLine(
+                    [r.last_trail_pos[0], r.last_trail_pos[1], r.trail_z],
+                    [pos[0], pos[1], r.trail_z],
+                    lineColorRGB=r.trail_color,
+                    lineWidth=3
+                ))
+                r.last_trail_pos = (pos[0], pos[1])
+
+            # ---- Live collision detection ----
+            # Acts on a fresh collision while DRIVING (normal driving) or
+            # REJOINING (actively driving a detour) -- if the detour itself
+            # ends up clipping the cone it was supposed to avoid, that's a
+            # real problem worth reacting to, not something to silently keep
+            # driving through. During REVERSING we ignore further contacts
+            # with the same cone (brief re-contact while backing away is
+            # expected) so we don't immediately re-enter collision-handling
+            # mid-maneuver.
+            collided_cone_pos = None
+            collided_cone_id = None
+            for cone_id in cone_body_ids:
+                contacts = p.getContactPoints(bodyA=r.body, bodyB=cone_id)
+                if contacts:
+                    last_hit = r.last_collision_time.get(cone_id, -999)
+                    if sim_time - last_hit > COLLISION_COOLDOWN:
+                        cone_pos, _ = p.getBasePositionAndOrientation(cone_id)
+                        hit_point = (round(cone_pos[0], 2), round(cone_pos[1], 2))
+
+                        if hit_point not in learned_obstacles and hit_point not in newly_learned:
+                            newly_learned.append(hit_point)
+                            print(f"Collision detected at {hit_point} -- "
+                                  f"remembering this location for future runs.")
+                            save_learned_obstacles(learned_obstacles + newly_learned)
+                        r.last_collision_time[cone_id] = sim_time
+
+                        can_react = r.state == STATE_DRIVING or r.state == STATE_REJOINING
+                        if can_react and cone_id not in r.diverted_cone_ids:
+                            r.diverted_cone_ids.add(cone_id)
+                            block_cells_around(cone_pos[0], cone_pos[1])
+                            collided_cone_pos = (cone_pos[0], cone_pos[1])
+                            collided_cone_id = cone_id
+
+            # ---- Transient obstacle collisions (cars, bay walls) ----
+            # Same reverse-and-rejoin reaction as a cone hit, but nothing is
+            # learned or added to the blocked map (see transient_obstacle_ids
+            # above). After reversing, find_rejoin_target/A* simply steer the
+            # robot back onto the ideal route.
+            transient_hit = False
+            if collided_cone_pos is None and r.state in (STATE_DRIVING, STATE_REJOINING):
+                # One query for every contact on the robot, then filter locally.
+                # Asking per body was 8 separate calls per frame, and in GUI mode
+                # each API call is a round trip to the physics server -- that
+                # alone was a large share of the GUI's frame cost.
+                touching = {c[2] for c in p.getContactPoints(bodyA=r.body)}
+                for body_id in (transient_obstacle_ids
+                        + [o.body for o in robots if o is not r]):
+                    if body_id in touching:
+                        last_hit = r.last_collision_time.get(body_id, -999)
+                        if sim_time - last_hit > COLLISION_COOLDOWN:
+                            r.last_collision_time[body_id] = sim_time
+                            transient_hit = True
+                            break
+
+            if collided_cone_pos is not None or transient_hit:
+                r.episode_collisions += 1
+                r.drive_signal = "STOP"
+                # Stop immediately, then switch to REVERSING -- back straight
+                # away from the obstacle before any replanning is attempted.
+                for joint in WHEEL_JOINTS:
+                    p.setJointMotorControl2(r.body, joint, p.VELOCITY_CONTROL, targetVelocity=0, force=15)
+                if transient_hit:
+                    print(f"Collision with a vehicle or wall at x={pos[0]:.1f}, "
+                          f"y={pos[1]:.1f}! Stopping and reversing away...")
+                else:
+                    print("Collision! Stopping and reversing away from obstacle...")
+                # If this collision interrupted an in-progress detour around a
+                # DIFFERENT cone, clear that previous cone's diverted flag now
+                # -- otherwise it would stay stuck in diverted_cone_ids forever
+                # since its own detour never got to finish normally.
+                if r.active_divert_cone_id is not None and r.active_divert_cone_id != collided_cone_id:
+                    r.diverted_cone_ids.discard(r.active_divert_cone_id)
+                r.state = STATE_REVERSING
+                r.reverse_start_pos = (pos[0], pos[1])
+                r.active_divert_cone_id = collided_cone_id
+                continue
+
+            if r.state == STATE_REVERSING:
+                traveled = math.hypot(pos[0] - r.reverse_start_pos[0], pos[1] - r.reverse_start_pos[1])
+                if traveled < REVERSE_DISTANCE:
                     for joint in WHEEL_JOINTS:
-                        p.setJointMotorControl2(robot, joint, p.VELOCITY_CONTROL,
+                        p.setJointMotorControl2(r.body, joint, p.VELOCITY_CONTROL,
+                                                 targetVelocity=REVERSE_SPEED, force=15)
+                    continue
+                else:
+                    # Far enough away now -- stop, then plan a short detour
+                    # around the obstacle that rejoins the original yellow
+                    # route, rather than a full replan straight to the goal.
+                    for joint in WHEEL_JOINTS:
+                        p.setJointMotorControl2(r.body, joint, p.VELOCITY_CONTROL, targetVelocity=0, force=15)
+                    print("Clear of obstacle -- planning detour back onto original route...")
+
+                    rejoin_point = find_rejoin_target(r.active_route, (pos[0], pos[1]))
+                    new_detour = find_path_with_runtime_blocked((pos[0], pos[1]), rejoin_point)
+
+                    if new_detour is None:
+                        print("No detour found around this obstacle! Stopping.")
+                        break
+
+                    r.detour_waypoints = new_detour
+                    r.detour_index = 0
+                    r.state = STATE_REJOINING
+                    continue
+
+            if r.state == STATE_REJOINING:
+                if r.detour_index >= len(r.detour_waypoints):
+                    # Detour complete -- resume normal driving. No index to
+                    # restore: lookahead_point_on_route will automatically
+                    # find wherever the robot now is on ideal_route and
+                    # continue from there.
+                    #
+                    # Clear this cone's "already diverted" flag now that the
+                    # maneuver has actually finished -- if the robot ends up
+                    # touching it again later, that's a genuine new collision
+                    # (e.g. the detour grazed it, or the robot drifted back
+                    # into it), not a stale leftover from this same maneuver,
+                    # so it should be free to trigger another reverse-and-detour.
+                    if r.active_divert_cone_id is not None:
+                        r.diverted_cone_ids.discard(r.active_divert_cone_id)
+                        r.active_divert_cone_id = None
+                    r.state = STATE_DRIVING
+                    continue
+
+                wx, wy = r.detour_waypoints[r.detour_index]
+                dx = wx - pos[0]
+                dy = wy - pos[1]
+                distance = math.hypot(dx, dy)
+
+                if distance < ARRIVAL_RADIUS:
+                    r.detour_index += 1
+                    continue
+
+                desired_heading = math.atan2(dy, dx)
+                heading_error = desired_heading - heading
+                heading_error = math.atan2(math.sin(heading_error), math.cos(heading_error))
+
+                turn_severity = min(abs(heading_error) / TURN_SEVERITY_ANGLE, 1.0)
+                base_speed = MAX_SPEED * (1.0 - (1.0 - TURN_SPEED_FLOOR) * turn_severity)
+                turn_gain = TURN_GAIN
+
+                left_speed = base_speed - turn_gain * heading_error
+                right_speed = base_speed + turn_gain * heading_error
+
+                p.setJointMotorControl2(r.body, 2, p.VELOCITY_CONTROL, targetVelocity=left_speed, force=WHEEL_FORCE)
+                p.setJointMotorControl2(r.body, 4, p.VELOCITY_CONTROL, targetVelocity=left_speed, force=WHEEL_FORCE)
+                p.setJointMotorControl2(r.body, 3, p.VELOCITY_CONTROL, targetVelocity=right_speed, force=WHEEL_FORCE)
+                p.setJointMotorControl2(r.body, 5, p.VELOCITY_CONTROL, targetVelocity=right_speed, force=WHEEL_FORCE)
+                continue
+
+            # ---- STATE_DRIVING: follow a lookahead point on the ideal_route ----
+            # Rather than driving toward discrete waypoints one at a time, find
+            # the point on ideal_route nearest the robot's current position,
+            # then aim for a point a fixed LOOKAHEAD_DISTANCE further along that
+            # same line. This is what lets the robot track the literal road
+            # centerline closely (since it's always correcting toward the
+            # actual line, not just toward sparse corners), and it also makes
+            # "resume normal driving after a detour" trivial -- there's no
+            # index to resume from, the robot just naturally finds wherever it
+            # currently is on the line and continues from there.
+            target_x, target_y, distance_remaining = lookahead_point_on_route(
+                r.active_route, (pos[0], pos[1]), LOOKAHEAD_DISTANCE)
+
+            if distance_remaining < ARRIVAL_RADIUS:
+                if r.do_return and r.leg == LEG_OUTBOUND:
+                    # Delivered. Wipe the trail of the leg just finished,
+                    # so only the drive to the NEXT destination is shown.
+                    # Two kinds of marker have to go: the GUI's debug
+                    # lines, and capture mode's disc bodies (debug lines
+                    # do not render offscreen, so the recorded trail is
+                    # made of discs -- clearing only the lines left the
+                    # old trail visible in the GIF).
+                    for _tid in r.trail_ids:
+                        try:
+                            p.removeUserDebugItem(_tid)
+                        except p.error:
+                            pass
+                    r.trail_ids.clear()
+                    for _bid in r.trail_disc_ids:
+                        try:
+                            p.removeBody(_bid)
+                        except p.error:
+                            pass
+                    r.trail_disc_ids.clear()
+                    # The capture panel keeps its own point list per
+                    # robot; that has to be reset too or the map keeps
+                    # drawing the finished leg even though the 3D discs
+                    # are gone.
+                    if SIM_CAPTURE and capture_map is not None:
+                        _idx = robots.index(r)
+                        _paths = capture_map.get("fleet_trails", [])
+                        if _idx < len(_paths):
+                            _paths[_idx][0].clear()
+                            _paths[_idx][1].clear()
+                        _tr = capture_map["art"]["trails"]
+                        if _idx < len(_tr):
+                            _tr[_idx].set_data([], [])
+                    r.last_trail_pos = (pos[0], pos[1])
+                    r.last_capture_marker = (pos[0], pos[1])
+
+                    # Turn around and take the other way home.
+                    r.leg = LEG_RETURN
+                    r.active_route = return_route
+                    r.gate_time = sim_time
+                    print(f"{r.name}: gate reached at {r.gate_time:.1f}s -- returning to the "
+                          f"depot via the apron midline and connector A.")
+                    # Stop, then let the next frame pick the robot up on the new
+                    # route: lookahead_point_on_route finds wherever it is on
+                    # whatever route is active, so no index needs resetting.
+                    for joint in WHEEL_JOINTS:
+                        p.setJointMotorControl2(r.body, joint, p.VELOCITY_CONTROL,
                                                  targetVelocity=0, force=15)
-                break  # only ever check the first road we're in range of
-        if blocked_by_car:
-            continue
+                    # The return leg re-uses the crossing machinery from the top.
+                    r.q_crossing_done = False
+                    r.q_go_active = False
+                    # Trail switches colour so the two legs are told apart.
+                    r.trail_color = RETURN_ROUTE_COLOR
+                    r.last_trail_pos = (pos[0], pos[1])
+                    if SIM_ROBOTS > len(robots) + len(pending_robots):
+                        # Deploy the next robot now the bay is free and
+                        # the first is heading home. It joins the fleet
+                        # between iterations, never during one.
+                        nxt = spawn_robot(f"robot-{len(robots) + 1}",
+                                          ideal_route, ROBOT2_TRAIL_COLOR,
+                                          do_return=SIM_RETURN)
+                        pending_robots.append(nxt)
+                        print(f"{nxt.name}: deployed from the depot.")
+                    if map_proc is not None:
+                        send_to_map({"type": "route",
+                                     "route": [list(pt) for pt in return_route]})
+                    if SIM_CAPTURE and capture_map is not None:
+                        # The capture panel is an in-process figure, so it needs
+                        # the same route swap the map process gets by message --
+                        # otherwise the recorded GIF shows the return leg being
+                        # driven against the outbound route.
+                        capture_map["art"]["route"].set_data(
+                            [pt[0] for pt in return_route],
+                            [pt[1] for pt in return_route])
+                        capture_map["trail_x"].clear()
+                        capture_map["trail_y"].clear()
+                    continue
 
+                r.target_reached = True
+                r.finished = True
+                if SIM_RETURN:
+                    print(f"{r.name}: depot reached at {sim_time:.1f}s -- "
+                          f"round trip complete!")
+                else:
+                    print(f"{r.name}: target reached!")
+                continue
 
-    if math.hypot(pos[0] - last_trail_pos[0], pos[1] - last_trail_pos[1]) > 0.03:
-        p.addUserDebugLine(
-            [last_trail_pos[0], last_trail_pos[1], 0.07],
-            [pos[0], pos[1], 0.07],
-            lineColorRGB=DRIVEN_TRAIL_COLOR,
-            lineWidth=3
-        )
-        last_trail_pos = (pos[0], pos[1])
+            wx, wy = target_x, target_y
+            dx = wx - pos[0]
+            dy = wy - pos[1]
 
-    # ---- Live collision detection ----
-    # Acts on a fresh collision while DRIVING (normal driving) or
-    # REJOINING (actively driving a detour) -- if the detour itself
-    # ends up clipping the cone it was supposed to avoid, that's a
-    # real problem worth reacting to, not something to silently keep
-    # driving through. During REVERSING we ignore further contacts
-    # with the same cone (brief re-contact while backing away is
-    # expected) so we don't immediately re-enter collision-handling
-    # mid-maneuver.
-    collided_cone_pos = None
-    collided_cone_id = None
-    for cone_id in cone_body_ids:
-        contacts = p.getContactPoints(bodyA=robot, bodyB=cone_id)
-        if contacts:
-            last_hit = last_collision_time.get(cone_id, -999)
-            if sim_time - last_hit > COLLISION_COOLDOWN:
-                cone_pos, _ = p.getBasePositionAndOrientation(cone_id)
-                hit_point = (round(cone_pos[0], 2), round(cone_pos[1], 2))
+            desired_heading = math.atan2(dy, dx)
+            heading_error = desired_heading - heading
+            # normalize to [-pi, pi]
+            heading_error = math.atan2(math.sin(heading_error), math.cos(heading_error))
 
-                if hit_point not in learned_obstacles and hit_point not in newly_learned:
-                    newly_learned.append(hit_point)
-                    print(f"Collision detected at {hit_point} -- "
-                          f"remembering this location for future runs.")
-                    save_learned_obstacles(learned_obstacles + newly_learned)
-                last_collision_time[cone_id] = sim_time
+            # Slow down when a sharp turn is needed, so the robot turns
+            # precisely instead of swinging wide and clipping obstacles.
+            # heading_error of 0 = full speed, heading_error near +-pi/2 or
+            # more = mostly just rotating in place.
+            turn_severity = min(abs(heading_error) / TURN_SEVERITY_ANGLE, 1.0)
+            base_speed = MAX_SPEED * (1.0 - (1.0 - TURN_SPEED_FLOOR) * turn_severity)
+            turn_gain = TURN_GAIN
 
-                can_react = state == STATE_DRIVING or state == STATE_REJOINING
-                if can_react and cone_id not in diverted_cone_ids:
-                    diverted_cone_ids.add(cone_id)
-                    block_cells_around(cone_pos[0], cone_pos[1])
-                    collided_cone_pos = (cone_pos[0], cone_pos[1])
-                    collided_cone_id = cone_id
+            left_speed = base_speed - turn_gain * heading_error
+            right_speed = base_speed + turn_gain * heading_error
 
-    # ---- Transient obstacle collisions (cars, bay walls) ----
-    # Same reverse-and-rejoin reaction as a cone hit, but nothing is
-    # learned or added to the blocked map (see transient_obstacle_ids
-    # above). After reversing, find_rejoin_target/A* simply steer the
-    # robot back onto the ideal route.
-    transient_hit = False
-    if collided_cone_pos is None and state in (STATE_DRIVING, STATE_REJOINING):
-        for body_id in transient_obstacle_ids:
-            contacts = p.getContactPoints(bodyA=robot, bodyB=body_id)
-            if contacts:
-                last_hit = last_collision_time.get(body_id, -999)
-                if sim_time - last_hit > COLLISION_COOLDOWN:
-                    last_collision_time[body_id] = sim_time
-                    transient_hit = True
-                    break
+            p.setJointMotorControl2(r.body, 2, p.VELOCITY_CONTROL, targetVelocity=left_speed, force=WHEEL_FORCE)
+            p.setJointMotorControl2(r.body, 4, p.VELOCITY_CONTROL, targetVelocity=left_speed, force=WHEEL_FORCE)
+            p.setJointMotorControl2(r.body, 3, p.VELOCITY_CONTROL, targetVelocity=right_speed, force=WHEEL_FORCE)
+            p.setJointMotorControl2(r.body, 5, p.VELOCITY_CONTROL, targetVelocity=right_speed, force=WHEEL_FORCE)
 
-    if collided_cone_pos is not None or transient_hit:
-        episode_collisions += 1
-        drive_signal = "STOP"
-        # Stop immediately, then switch to REVERSING -- back straight
-        # away from the obstacle before any replanning is attempted.
-        for joint in WHEEL_JOINTS:
-            p.setJointMotorControl2(robot, joint, p.VELOCITY_CONTROL, targetVelocity=0, force=15)
-        if transient_hit:
-            print(f"Collision with a vehicle or wall at x={pos[0]:.1f}, "
-                  f"y={pos[1]:.1f}! Stopping and reversing away...")
-        else:
-            print("Collision! Stopping and reversing away from obstacle...")
-        # If this collision interrupted an in-progress detour around a
-        # DIFFERENT cone, clear that previous cone's diverted flag now
-        # -- otherwise it would stay stuck in diverted_cone_ids forever
-        # since its own detour never got to finish normally.
-        if active_divert_cone_id is not None and active_divert_cone_id != collided_cone_id:
-            diverted_cone_ids.discard(active_divert_cone_id)
-        state = STATE_REVERSING
-        reverse_start_pos = (pos[0], pos[1])
-        active_divert_cone_id = collided_cone_id
-        continue
-
-    if state == STATE_REVERSING:
-        traveled = math.hypot(pos[0] - reverse_start_pos[0], pos[1] - reverse_start_pos[1])
-        if traveled < REVERSE_DISTANCE:
-            for joint in WHEEL_JOINTS:
-                p.setJointMotorControl2(robot, joint, p.VELOCITY_CONTROL,
-                                         targetVelocity=REVERSE_SPEED, force=15)
-            continue
-        else:
-            # Far enough away now -- stop, then plan a short detour
-            # around the obstacle that rejoins the original yellow
-            # route, rather than a full replan straight to the goal.
-            for joint in WHEEL_JOINTS:
-                p.setJointMotorControl2(robot, joint, p.VELOCITY_CONTROL, targetVelocity=0, force=15)
-            print("Clear of obstacle -- planning detour back onto original route...")
-
-            rejoin_point = find_rejoin_target((pos[0], pos[1]))
-            new_detour = find_path_with_runtime_blocked((pos[0], pos[1]), rejoin_point)
-
-            if new_detour is None:
-                print("No detour found around this obstacle! Stopping.")
-                break
-
-            detour_waypoints = new_detour
-            detour_index = 0
-            state = STATE_REJOINING
-            continue
-
-    if state == STATE_REJOINING:
-        if detour_index >= len(detour_waypoints):
-            # Detour complete -- resume normal driving. No index to
-            # restore: lookahead_point_on_route will automatically
-            # find wherever the robot now is on ideal_route and
-            # continue from there.
-            #
-            # Clear this cone's "already diverted" flag now that the
-            # maneuver has actually finished -- if the robot ends up
-            # touching it again later, that's a genuine new collision
-            # (e.g. the detour grazed it, or the robot drifted back
-            # into it), not a stale leftover from this same maneuver,
-            # so it should be free to trigger another reverse-and-detour.
-            if active_divert_cone_id is not None:
-                diverted_cone_ids.discard(active_divert_cone_id)
-                active_divert_cone_id = None
-            state = STATE_DRIVING
-            continue
-
-        wx, wy = detour_waypoints[detour_index]
-        dx = wx - pos[0]
-        dy = wy - pos[1]
-        distance = math.hypot(dx, dy)
-
-        if distance < ARRIVAL_RADIUS:
-            detour_index += 1
-            continue
-
-        desired_heading = math.atan2(dy, dx)
-        heading_error = desired_heading - heading
-        heading_error = math.atan2(math.sin(heading_error), math.cos(heading_error))
-
-        turn_severity = min(abs(heading_error) / TURN_SEVERITY_ANGLE, 1.0)
-        base_speed = MAX_SPEED * (1.0 - (1.0 - TURN_SPEED_FLOOR) * turn_severity)
-        turn_gain = TURN_GAIN
-
-        left_speed = base_speed - turn_gain * heading_error
-        right_speed = base_speed + turn_gain * heading_error
-
-        p.setJointMotorControl2(robot, 2, p.VELOCITY_CONTROL, targetVelocity=left_speed, force=WHEEL_FORCE)
-        p.setJointMotorControl2(robot, 4, p.VELOCITY_CONTROL, targetVelocity=left_speed, force=WHEEL_FORCE)
-        p.setJointMotorControl2(robot, 3, p.VELOCITY_CONTROL, targetVelocity=right_speed, force=WHEEL_FORCE)
-        p.setJointMotorControl2(robot, 5, p.VELOCITY_CONTROL, targetVelocity=right_speed, force=WHEEL_FORCE)
-        continue
-
-    # ---- STATE_DRIVING: follow a lookahead point on the ideal_route ----
-    # Rather than driving toward discrete waypoints one at a time, find
-    # the point on ideal_route nearest the robot's current position,
-    # then aim for a point a fixed LOOKAHEAD_DISTANCE further along that
-    # same line. This is what lets the robot track the literal road
-    # centerline closely (since it's always correcting toward the
-    # actual line, not just toward sparse corners), and it also makes
-    # "resume normal driving after a detour" trivial -- there's no
-    # index to resume from, the robot just naturally finds wherever it
-    # currently is on the line and continues from there.
-    target_x, target_y, distance_remaining = lookahead_point_on_route(
-        ideal_route, (pos[0], pos[1]), LOOKAHEAD_DISTANCE)
-
-    if distance_remaining < ARRIVAL_RADIUS:
-        target_reached = True
-        print("Target reached!")
+    except p.error:
+        print("Simulation window was closed -- exiting.")
         break
 
-    wx, wy = target_x, target_y
-    dx = wx - pos[0]
-    dy = wy - pos[1]
+    # Robots deploy between iterations, never during one.
+    if pending_robots:
+        robots.extend(pending_robots)
+        pending_robots.clear()
 
-    desired_heading = math.atan2(dy, dx)
-    heading_error = desired_heading - heading
-    # normalize to [-pi, pi]
-    heading_error = math.atan2(math.sin(heading_error), math.cos(heading_error))
-
-    # Slow down when a sharp turn is needed, so the robot turns
-    # precisely instead of swinging wide and clipping obstacles.
-    # heading_error of 0 = full speed, heading_error near +-pi/2 or
-    # more = mostly just rotating in place.
-    turn_severity = min(abs(heading_error) / TURN_SEVERITY_ANGLE, 1.0)
-    base_speed = MAX_SPEED * (1.0 - (1.0 - TURN_SPEED_FLOOR) * turn_severity)
-    turn_gain = TURN_GAIN
-
-    left_speed = base_speed - turn_gain * heading_error
-    right_speed = base_speed + turn_gain * heading_error
-
-    p.setJointMotorControl2(robot, 2, p.VELOCITY_CONTROL, targetVelocity=left_speed, force=WHEEL_FORCE)
-    p.setJointMotorControl2(robot, 4, p.VELOCITY_CONTROL, targetVelocity=left_speed, force=WHEEL_FORCE)
-    p.setJointMotorControl2(robot, 3, p.VELOCITY_CONTROL, targetVelocity=right_speed, force=WHEEL_FORCE)
-    p.setJointMotorControl2(robot, 5, p.VELOCITY_CONTROL, targetVelocity=right_speed, force=WHEEL_FORCE)
+    if all(rb.finished for rb in robots):
+        break
 
 if newly_learned:
     print(f"Learned {len(newly_learned)} new obstacle location(s) this run. "
@@ -1981,9 +2482,22 @@ if SIM_CAPTURE and capture_frames:
 
 # Machine-readable episode summary, parsed by evaluate.py. epsilon is
 # the exploration rate that was USED this run (before decay).
-print(f"RESULT success={int(target_reached)} sim_time={sim_time:.2f} "
-      f"collisions={episode_collisions} near_misses={episode_near_misses} "
-      f"go={episode_go_decisions} wait={episode_wait_decisions} "
+# Fleet-aggregated summary. Field names are unchanged so evaluate.py and
+# the tests keep parsing it: with one robot every number is exactly what
+# it was before. gate_time/leg describe the lead robot; counts are fleet
+# totals.
+lead = robots[0]
+print(f"RESULT success={int(all(rb.target_reached for rb in robots))} "
+      f"sim_time={sim_time:.2f} "
+      f"collisions={sum(rb.episode_collisions for rb in robots)} "
+      f"near_misses={sum(rb.episode_near_misses for rb in robots)} "
+      f"go={sum(rb.episode_go_decisions for rb in robots)} "
+      f"wait={sum(rb.episode_wait_decisions for rb in robots)} "
+      f"hold={sum(rb.episode_crossing_hold for rb in robots):.2f} "
+      f"crossing={SIM_CROSSING} "
+      f"gate_time={lead.gate_time if lead.gate_time is not None else sim_time:.2f} "
+      f"leg={lead.leg} robots={len(robots)} "
+      f"rtf={sim_time / max(1e-6, time.perf_counter() - loop_start_wall):.2f} "
       f"epsilon={q_epsilon:.4f} run={q_run_count}")
 
 # Closing the map's stdin tells it the run is over; it closes its
