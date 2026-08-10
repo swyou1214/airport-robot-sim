@@ -45,6 +45,18 @@ ROAD = "#9095a0"
 ROAD_EDGE = "#eceff1"   # dashed centreline drawn over the road slabs
 ROUTE = "#ffc400"
 TRAIL = "#e02020"
+# One trail colour per robot, matching the 3D view's debug-line colours.
+# Later robots draw at a higher zorder so where trails overlap the newer
+# one is the visible line rather than whichever matplotlib picked.
+TRAIL_COLORS = ["#e02020", "#2660ff", "#f0a000", "#8a3ffc"]
+def raise_trail(line):
+    """No-op, kept so callers need not branch.
+
+    Raising the growing trail to the front was the cause of the flashing:
+    with two robots both appending points, their z-orders swapped every
+    frame and the overlap flipped red/blue. Trail order is now fixed
+    (earlier robot on top, matching the 3D view), and trails are cleared
+    at each destination so overlap is rare in the first place."""
 BAY = "#2e9e4f"
 INK = "#1a1a1a"
 INK_SOFT = "#5a5f6a"
@@ -66,7 +78,7 @@ _view = {"span": FOLLOW_SPAN, "max_span": 32.0}
 # Shared slot: the reader thread drops the newest state here, the main
 # thread renders whatever it finds. Intermediate states are discarded
 # on purpose -- a map only ever needs the latest position.
-_latest = {"state": None, "init": None, "closed": False}
+_latest = {"state": None, "init": None, "route": None, "closed": False}
 _lock = threading.Lock()
 
 
@@ -81,8 +93,13 @@ def _reader():
         except json.JSONDecodeError:
             continue
         with _lock:
-            if msg.get("type") == "init":
+            kind = msg.get("type")
+            if kind == "init":
                 _latest["init"] = msg
+            elif kind == "route":
+                # The sim switched legs (outbound -> return): redraw the
+                # planned route rather than the whole figure.
+                _latest["route"] = (msg.get("robot", 0), msg["route"])
             else:
                 _latest["state"] = msg
     with _lock:
@@ -137,9 +154,9 @@ def build_figure(init, figsize=(5.4, 5.8), controls=True):
                            facecolor=BAY, alpha=0.30, edgecolor=BAY,
                            linewidth=1.4, zorder=2))
     route = init["route"]
-    ax.plot([p[0] for p in route], [p[1] for p in route],
-            color=ROUTE, linewidth=3.0, solid_capstyle="round",
-            solid_joinstyle="round", zorder=3)
+    route_line, = ax.plot([p[0] for p in route], [p[1] for p in route],
+                          color=ROUTE, linewidth=3.0, solid_capstyle="round",
+                          solid_joinstyle="round", zorder=3)
     tx, ty = init["target"]
     ax.plot([tx], [ty], marker="v", markersize=11, color=BAY,
             markeredgecolor="white", markeredgewidth=1.2, zorder=6)
@@ -157,9 +174,23 @@ def build_figure(init, figsize=(5.4, 5.8), controls=True):
                           edgecolor="white", linewidth=0.7, zorder=5)
         ax.add_patch(patch)
         cars.append(patch)
-    robot = Polygon(robot_marker(0, 0, 0), closed=True, facecolor=GO_COLOR,
-                    edgecolor="white", linewidth=1.3, zorder=7)
-    ax.add_patch(robot)
+    # A fleet's worth of artists, created up front and revealed as
+    # robots are deployed -- a robot can join mid-run, and adding
+    # artists to a live figure mid-render is fiddlier than hiding them.
+    MAX_ROBOTS = 4
+    robot_arrows, robot_trails = [], []
+    for i in range(MAX_ROBOTS):
+        arrow = Polygon(robot_marker(0, 0, 0), closed=True,
+                        facecolor=GO_COLOR, edgecolor="white",
+                        linewidth=1.3, zorder=7, visible=False)
+        ax.add_patch(arrow)
+        robot_arrows.append(arrow)
+        # Earlier robots draw on top, a fixed order that cannot flicker.
+        tline, = ax.plot([], [], color=TRAIL_COLORS[i % len(TRAIL_COLORS)],
+                         linewidth=2.4, solid_capstyle="round",
+                         zorder=4 + (MAX_ROBOTS - i) * 0.1, visible=False)
+        robot_trails.append(tline)
+    robot = robot_arrows[0]
 
     banner = ax.text(0.5, 0.965, "GO", transform=ax.transAxes,
                      ha="center", va="top", fontsize=15, weight="bold",
@@ -195,7 +226,8 @@ def build_figure(init, figsize=(5.4, 5.8), controls=True):
     _view["max_span"] = max(world[2] - world[0], world[3] - world[1])
 
     art = dict(trail=trail, cars=cars, robot=robot, banner=banner,
-               readout=readout, world=world)
+               readout=readout, world=world, route=route_line,
+               arrows=robot_arrows, trails=robot_trails)
     if not controls:
         return fig, ax, art
 
@@ -226,12 +258,29 @@ def build_figure(init, figsize=(5.4, 5.8), controls=True):
     return fig, ax, art
 
 
-def apply_view(ax, rx, ry):
-    """Keep the robot centred in the view at the current zoom level --
-    the map slides under it, like a car navigation display. Zooming
-    out therefore always keeps the robot in the middle rather than
-    locking to the map's centre."""
-    span_x = _view["span"]
+def effective_span(rx, ry, fleet=None):
+    """View half-width: purely the chosen zoom.
+
+    The fleet deliberately does NOT influence it. Auto-widening to hold
+    a distant robot was tried and dropped: keeping a robot 20m away in
+    frame doubles the span, which shrinks the view of the robot the map
+    is actually following. The lead robot keeps a steady, close framing
+    and other robots are drawn whenever they fall inside it."""
+    return _view["span"]
+
+
+def marker_size(span):
+    """Keep robot arrows a constant size ON SCREEN. Without this, a
+    view widened to hold a distant robot shrinks every robot to an
+    unreadable speck -- the fleet is in frame but nobody can see it."""
+    return 0.85 * max(1.0, span / FOLLOW_SPAN)
+
+
+def apply_view(ax, rx, ry, fleet=None):
+    """Keep the LEAD robot centred at the chosen zoom -- the map slides
+    under it, like a car navigation display. Other robots are drawn but
+    do not pull the framing around; the lead robot stays the subject."""
+    span_x = effective_span(rx, ry, fleet)
     span_y = span_x * 1.08
     ax.set_xlim(rx - span_x, rx + span_x)
     ax.set_ylim(ry - span_y, ry + span_y)
@@ -259,27 +308,51 @@ def main():
         with _lock:
             state = _latest["state"]
             closed = _latest["closed"]
+            new_route = _latest.pop("route", None)
+            _latest["route"] = None
+        if new_route:
+            which, pts = new_route
+            # Only the robot that switched legs restarts its trail --
+            # clearing all of them let robot 2 reaching the gate wipe
+            # robot 1's history off the map. The drawn planned route
+            # follows the lead robot, so only it repoints that.
+            if 0 <= which < len(art["trails"]):
+                art["trails"][which].set_data([], [])
+            if which == 0:
+                art["route"].set_data([p[0] for p in pts],
+                                      [p[1] for p in pts])
         if state is None:
             if closed:
                 break
             plt.pause(1.0 / RENDER_HZ)
             continue
 
-        rx, ry, heading = state["robot"]
-        art["robot"].set_xy(robot_marker(rx, ry, heading))
+        fleet = state.get("robots") or [list(state["robot"]) +
+                                       [state.get("signal", "GO")]]
+        rx, ry, heading = fleet[0][0], fleet[0][1], fleet[0][2]
+        msize = marker_size(effective_span(rx, ry, fleet))
+        for i, arrow in enumerate(art["arrows"]):
+            if i < len(fleet):
+                fx, fy, fh, fsig = fleet[i]
+                arrow.set_xy(robot_marker(fx, fy, fh, size=msize))
+                arrow.set_facecolor(GO_COLOR if fsig == "GO" else STOP_COLOR)
+                arrow.set_visible(True)
+                tl = art["trails"][i]
+                xs, ys = list(tl.get_xdata()), list(tl.get_ydata())
+                if not xs or math.hypot(fx - xs[-1], fy - ys[-1]) > 0.12:
+                    xs.append(fx); ys.append(fy)
+                    tl.set_data(xs, ys)
+                    raise_trail(tl)
+                tl.set_visible(True)
+            else:
+                arrow.set_visible(False)
 
-        signal = state.get("signal", "GO")
+        signal = fleet[0][3]
         if signal != last_signal:
             color = GO_COLOR if signal == "GO" else STOP_COLOR
-            art["robot"].set_facecolor(color)
             art["banner"].set_text(signal)
             art["banner"].get_bbox_patch().set_facecolor(color)
             last_signal = signal
-
-        if not trail_x or math.hypot(rx - trail_x[-1], ry - trail_y[-1]) > 0.12:
-            trail_x.append(rx)
-            trail_y.append(ry)
-            art["trail"].set_data(trail_x, trail_y)
 
         for patch, (cx, cy) in zip(art["cars"], state["cars"]):
             patch.set_xy((cx - 0.8, cy - 0.35))
@@ -288,10 +361,10 @@ def main():
         speed = state.get("speed", 0.0)
         eta = f"{remaining / speed:.0f}s" if speed > 0.25 else "--"
         art["readout"].set_text(
-            f"{remaining:5.1f} m to gate     ETA {eta}     "
+            f"{remaining:5.1f} m to go     ETA {eta}     "
             f"{speed:4.1f} m/s     {state.get('state', '')}")
 
-        apply_view(ax, rx, ry)
+        apply_view(ax, rx, ry, fleet)
 
         fig.canvas.draw_idle()
         fig.canvas.flush_events()
