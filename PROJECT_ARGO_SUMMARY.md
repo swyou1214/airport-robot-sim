@@ -250,6 +250,69 @@ If you last saw the old summary, these are the deltas:
 
 ---
 
+## Round trip + A/B (added 2026-08)
+
+**A/B: learned crossing vs rule baseline** (`evaluate.py --ab N`).
+`SIM_CROSSING=q|rule` swaps the service-road controller; `SIM_FREEZE_Q=1`
+makes the Q arm greedy with no updates. Every seed runs under both arms
+(identical traffic), which removes the traffic variance that would
+otherwise swamp the effect. New `hold=` field in RESULT measures seconds
+held at that crossing, from the commanded signal and position, so both
+policies are scored identically.
+
+Result (40 paired seeds): **both 40/40 success, 0 collisions, 0 near
+misses; mean crossing hold 0.49s (Q) vs 1.06s (rule)**. On the 23
+contested seeds: 0.85s vs 1.83s, a 54% delay reduction at equal safety.
+Q faster on 9 seeds, rule faster on 0, tied on 31. -> ab_comparison.png
+
+**Round trip** (`SIM_RETURN=1`, opt-in). Gate -> depot by a different
+route: apron (offset lane) -> Gate A connector -> service road ->
+connector A. Leg state machine swaps `active_route`; crossing windows
+became direction-aware and use the robot's actual x (the return crosses
+the apron front at x=8, not 14).
+
+Three geometry bugs found by measurement, all the same class -- a hold
+window reaching into a NEIGHBOURING road's car lane, because the apron
+roads are only 3m apart while cars occupy +/-0.35m and the robot is ~1m:
+1. lane-entry standoff 1.5-3.5m parked the robot at y=18.5, inside the
+   apron-back lane -> 18 collisions/episode. Narrowed to 1.2-1.8m.
+2. descending crossing standoff of 1.0m left 0.15m clearance.
+3. descending stop margin of 2.5m reached into the next lane, so holding
+   for the apron front parked in midline traffic (9 collisions on one
+   seed). Cut to 2.0m. The safe band between two roads is
+   [lane_edge + robot_half, next_lane_edge - robot_half].
+
+Also proven by measurement: a gap reservation cannot work for the 6m
+apron leg (robot 1.4 m/s vs a 5 m/s car on a 20m range -> deadlock every
+episode). That leg needs lane discipline, hence the y=16.8 offset.
+
+Status: 6/6 seeds complete the round trip; 2 of 6 still take one
+recoverable collision on the return leg (recovery handles it, all
+succeed). Not yet at the outbound leg's 0.01/episode.
+
+## Fleet + trails (added 2026-08)
+
+All per-robot state (route, leg, state machine, signal light, trail,
+detour bookkeeping, Q-crossing latches, metrics) lives on a `Robot`;
+the loop iterates `for r in robots`, which keeps every `continue` in
+the control logic meaning "skip the rest of THIS robot's frame". The
+Q-table is shared, so both robots learn one policy.
+
+Trails show only the leg in progress: arriving at a destination wipes
+that robot's trail. Trail state lives in FOUR stores and all four must
+be reset, which took three attempts to get right — GUI debug lines,
+capture-mode disc bodies (debug lines don't render offscreen, so
+recordings use discs), the live map process, and the capture panel's
+own per-robot point list.
+
+Overlap ordering: the 3D view uses fixed per-robot heights 2cm apart.
+Per-segment recency ordering was tried and reverted — it needs
+interleaved heights a fraction of a millimetre apart, which the depth
+buffer cannot resolve at this camera distance, so overlapping trails
+flickered. The 2D map has no depth buffer and orders by painter's
+order, fixed per robot; raising the growing trail to the front there
+caused the same flicker by swapping z-order every frame.
+
 ## Known issues / limitations
 
 1. **Q-state has no car-speed feature** and covers only the service
@@ -257,8 +320,16 @@ If you last saw the old summary, these are the deltas:
    would need per-road or shared state.
 2. **No same-lane traffic handling** — no overtaking; the taxiway is
    kept car-free by design.
-3. **Single agent** — a second robot needs conflict resolution /
-   dispatcher at shared connectors.
+3. **Two robots, no dispatcher.** `SIM_ROBOTS=2` deploys a second robot
+   when the first turns for home. They stay out of phase by
+   construction — the second is outbound while the first returns — so
+   they never contest the shared taxiway stretch in practice. Verified
+   on seed 205: the one collision there happens after the other robot
+   has already finished, i.e. it is the known return-leg lane
+   fragility, not a robot-robot conflict. A third robot, or any change
+   to the deployment timing, would need a real dispatcher: the natural
+   fit is feeding the other robots into `lane_conflict_free()`, which
+   already forward-simulates moving obstacles.
 4. **No sensor simulation** — perfect state via PyBullet API.
 5. **`smooth_path` can still cut corners** where short apron segments
    are geometrically close.
