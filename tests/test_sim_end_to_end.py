@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -38,6 +40,44 @@ def test_random_traffic_episode_reaches_gate():
     # unseeded traffic: exercises the crossing logic under fresh timing
     result = run_sim({"SIM_TIME_LIMIT": "150"})
     assert result["success"] == "1"
+
+
+def test_round_trip_returns_to_depot():
+    """SIM_RETURN drives the gate leg and then a different route home."""
+    result = run_sim({"SIM_SEED": "205", "SIM_RETURN": "1",
+                      "SIM_TIME_LIMIT": "220"})
+    assert result["success"] == "1"
+    assert result["leg"] == "RETURN"
+    # the return leg is real travel, not an instant finish
+    assert float(result["sim_time"]) > float(result["gate_time"]) + 15
+
+
+def test_return_leg_is_opt_in():
+    """Without SIM_RETURN the episode still ends at the gate, so the
+    documented depot-to-gate baselines keep measuring the same task."""
+    result = run_sim({"SIM_SEED": "205", "SIM_TIME_LIMIT": "150"})
+    assert result["leg"] == "OUTBOUND"
+    assert float(result["sim_time"]) == pytest.approx(
+        float(result["gate_time"]), abs=0.01)
+
+
+def test_second_robot_deploys_on_the_return_leg():
+    """SIM_ROBOTS=2 puts a second robot on the tarmac when the first
+    turns for home, and both complete their missions."""
+    result = run_sim({"SIM_SEED": "205", "SIM_RETURN": "1",
+                      "SIM_ROBOTS": "2", "SIM_TIME_LIMIT": "250"})
+    assert result["success"] == "1"
+    assert result["robots"] == "2"
+    # each robot decides its own crossing, so the fleet makes two
+    assert int(result["go"]) + int(result["wait"]) >= 2
+
+
+def test_fleet_is_opt_in():
+    """Without SIM_ROBOTS the run is a single robot, so every recorded
+    baseline keeps measuring what it measured."""
+    result = run_sim({"SIM_SEED": "205", "SIM_TIME_LIMIT": "150"})
+    assert result["robots"] == "1"
+    assert float(result["sim_time"]) == pytest.approx(24.47, abs=0.05)
 
 
 def test_capture_writes_composite_gif(tmp_path):
