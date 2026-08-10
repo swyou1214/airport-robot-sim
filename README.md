@@ -158,6 +158,72 @@ A typical learned table — note the direction split at equal distance:
  7-9m appr: WAIT= 0.0  GO=+11.7 -> prefers GO
 ```
 
+### Round trip (`SIM_RETURN=1`)
+With this set, reaching the gate is not the end: the robot turns around
+and drives back to the depot by a **different route** — west along the
+apron, down the Gate A connector, along the service road, and down
+connector A to the taxiway. It shares no horizontal road and no
+connector with the outbound leg. A round trip takes ~58–75s against
+~25s for the outbound leg alone.
+
+Two of the return legs run *along* a road carrying traffic rather than
+across it, which the robot has no overtaking behaviour for. They are
+handled differently because the geometry forces it:
+
+- The 6m apron leg runs **offset to y=16.8** rather than on the y=15
+  centreline — lane discipline, so the car passes alongside. A gap-based
+  reservation is provably unusable there: the robot needs ~4.3s to cover
+  6m while the midline car sweeps 20m at 5 m/s, so it always catches up.
+  That version deadlocked in every episode tested.
+- The 2m service-road leg keeps to the centreline and uses
+  `lane_conflict_free()`, which forward-simulates the robot and each car
+  (bounces included) and only commits if they never conflict. That *is*
+  satisfiable over 2m.
+
+It is opt-in so the documented depot-to-gate measurements above keep
+measuring the task they were recorded against.
+
+### Two robots (`SIM_ROBOTS=2`)
+The moment the first robot reaches the gate and turns for home, a
+second is deployed from the depot on the outbound route — so the bay is
+free. Both do the full round trip, and they stay out of phase by
+construction: the second is still outbound while the first is coming
+home, which is why no dispatcher is needed yet.
+
+Every piece of mutable state lives on a `Robot`, so one body of control
+logic drives both: each has its own route, leg, state machine, signal
+light, trail, detour bookkeeping and — importantly — its own
+Q-crossing latches, so two robots at the service road cannot corrupt
+each other's pending decision. The **Q-table is shared**: both learn
+into one policy. Robots also treat each other as obstacles, so a bump
+triggers the same reverse-and-rejoin recovery a car would.
+
+```bash
+SIM_RETURN=1 SIM_ROBOTS=2 python robot_sim.py
+```
+
+![Two robots — the second deploys from the depot as the first turns for
+home; both round trips run out of phase](docs/two_robots.gif)
+
+Measured over three seeds: both robots complete every time, ~87-93s for
+the pair. Two seeds carry one recoverable collision on a return leg --
+the same service-road lane-reservation fragility a single robot has, not
+a robot-robot conflict (it occurs after the other robot has finished).
+
+Both viewers show the fleet. The navigation map draws an arrow per robot
+(revealed as they deploy) coloured by that robot's GO/STOP signal, plus
+a trail per robot — **red for robot 1, blue for robot 2**, matching the
+3D view. The map keeps a steady framing on the lead robot at whatever
+zoom you choose; other robots are drawn when they fall inside it and
+never pull the view around.
+
+**Trails show only the leg in progress.** Reaching a destination wipes
+that robot's trail, so what you see is the drive to its *next* stop
+rather than an accumulating tangle. That takes clearing four separate
+stores — the GUI's debug lines, capture mode's disc markers (debug lines
+don't render offscreen, so recordings use discs), the live map process,
+and the capture panel's own point list.
+
 ### Collision recovery
 Contact with any car or wall triggers a state machine: stop →
 **REVERSING** (back off 1.2m) → **REJOINING** (A* detour back onto the
@@ -198,6 +264,10 @@ Environment hooks (used by the harness, available manually too):
 | `SIM_SEED=<int>` | reproducible traffic + exploration |
 | `SIM_CAPTURE=<path.gif>` | render the run offscreen and write an animated GIF |
 | `SIM_MAP=0` | suppress the 2D navigation map window |
+| `SIM_RETURN=1` | after the gate, drive back to the depot by a different route |
+| `SIM_ROBOTS=2` | deploy a second robot when the first turns for home (needs `SIM_RETURN`) |
+| `SIM_CROSSING=rule` | hand the service-road crossing to the rule baseline |
+| `SIM_FREEZE_Q=1` | greedy evaluation: no exploration, no Q updates |
 
 The README demo was captured with:
 
