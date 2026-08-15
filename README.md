@@ -23,9 +23,9 @@ episodes each):
   mean 25.4s depot-to-gate — with every collision/near-miss
   concentrated in the exploration phase (5 of 6 incident episodes in
   the first 21; zero in the final 50) →
-  `learning_curve_from-scratch.png`
+  `evaluation/learning_curve_from-scratch.png`
 - **Trained policy**: 100% success, mean 25.6s, 0.01
-  collisions/episode → `learning_curve_trained-policy.png`
+  collisions/episode → `evaluation/learning_curve_trained-policy.png`
 
 ---
 
@@ -35,7 +35,7 @@ episodes each):
 # Python 3.10 virtualenv with pybullet + matplotlib (see install note below)
 python robot_sim.py            # watch one run in the GUI (real time)
 python evaluate.py             # run 20 headless episodes, print stats,
-                               # regenerate learning_curve.png
+                               # regenerate evaluation/learning_curve.png
 ```
 
 Every run of `robot_sim.py` updates `q_table.json`, so the crossing
@@ -43,7 +43,7 @@ agent keeps learning across runs — GUI and headless alike. That file
 is not tracked in git: a fresh clone starts from a blank table and
 trains its own, exactly as the from-scratch curve above shows. (The
 trained table those measurements ended on is preserved as
-`final_q_table` inside `eval_results_trained-policy.json`.)
+`final_q_table` inside `evaluation/eval_results_trained-policy.json`.)
 
 ### GUI controls
 
@@ -102,10 +102,15 @@ Gate bay: walled enclosure y=20–26 centred on x=14 (the destination)
 Parked plane: static aircraft to the right of the bay
 ```
 
-The robot follows the fixed gold-yellow **ideal route** — the literal
-road centerline from the depot, along the taxiway, up connector B, and
-through the apron into the gate bay — via pure pursuit (1m lookahead).
-Its actually-driven path is drawn as a red breadcrumb trail.
+The robot follows a fixed **ideal route** — the literal road centerline
+from the depot, along the taxiway, up connector B, and through the
+apron into the gate bay — via pure pursuit (1m lookahead).
+
+The two views divide the work: the **3D window** shows what the robot
+did (breadcrumb trails, red for robot 1 and blue for robot 2, switching
+to cyan on a return leg) against the road network's own dashed
+centrelines, while the **navigation map** shows the plan — both routes,
+drawn from the start and never repainted.
 
 Each car's starting position and direction are **randomized every
 run**, so no two episodes present the same traffic timing. Set
@@ -251,9 +256,9 @@ Each episode runs `robot_sim.py` headless in a fresh subprocess and
 reports success, navigation time, collisions, near-misses, and
 decisions, then the harness aggregates everything into:
 
-- `learning_curve.png` — navigation time, trailing success rate,
+- `evaluation/learning_curve.png` — navigation time, trailing success rate,
   Q-table convergence (Σ|ΔQ| per episode), and ε decay
-- `eval_results.json` — raw per-episode records + final Q-table
+- `evaluation/eval_results.json` — raw per-episode records + final Q-table
 
 Environment hooks (used by the harness, available manually too):
 
@@ -291,8 +296,8 @@ airport-robot/
 ├── evaluate.py             # evaluation harness (~300 lines)
 ├── q_table.json            # learned crossing policy (auto-generated, untracked)
 ├── learned_obstacles.json  # static-obstacle memory (auto-generated, untracked)
-├── eval_results*.json      # evaluation records (auto-generated; --tag names)
-├── learning_curve*.png     # evaluation figures (auto-generated)
+├── evaluation/             # eval records + learning curves (auto-generated)
+├── ab_comparison/          # A/B records + comparison figure (auto-generated)
 ├── docs/demo.gif           # captured demo run (SIM_CAPTURE)
 ├── README.md
 └── PROJECT_ARGO_SUMMARY.md # technical summary for development
