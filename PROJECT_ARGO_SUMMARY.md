@@ -29,8 +29,8 @@ airport-robot/
 ├── evaluate.py             # Evaluation harness (~300 lines)
 ├── q_table.json            # Q-learning state, persists across runs (auto-generated, gitignored)
 ├── learned_obstacles.json  # Static-obstacle memory (auto-generated)
-├── eval_results*.json      # Evaluation records (auto-generated; --tag names)
-├── learning_curve*.png     # Evaluation figures (auto-generated)
+├── evaluation/             # Eval records + learning curves (auto-generated)
+├── ab_comparison/          # A/B records + figure (auto-generated)
 ├── README.md               # User-facing documentation
 └── PROJECT_ARGO_SUMMARY.md # This file
 ```
@@ -85,15 +85,21 @@ env var seeds both traffic and ε-exploration for reproducible runs.
 
 ---
 
-## ideal_route (the yellow line)
+## ideal_route (the tracked path)
 
 ```python
 ideal_route = [(0,0), (14,0), (14,8), (14,12), (14,15), (14,20), (14,23)]
 ```
 
-Drawn once as a gold line; never changes. Tracked with
-`lookahead_point_on_route()` (pure pursuit, 1m lookahead). A* +
-`smooth_path` are used only for reactive post-collision detours.
+Tracked with `lookahead_point_on_route()` (pure pursuit, 1m
+lookahead); never changes. A* + `smooth_path` are used only for
+reactive post-collision detours.
+
+NOT drawn in the 3D view -- the planned-route overlay (gold outbound,
+cyan return) was removed there, since the road network's dashed
+centrelines already show where the robot can go and the breadcrumb
+trail shows where it went. The navigation map still draws both legs;
+that is the view whose job is showing the plan.
 
 ---
 
@@ -185,7 +191,7 @@ forward walk along the route, +1m clearance) → A* detour
 
 Runs N headless episodes as fresh subprocesses, parses each episode's
 machine-readable `RESULT` line, snapshots `q_table.json` after every
-episode, and writes `eval_results.json` + `learning_curve.png`
+episode, and writes `evaluation/eval_results.json` + `learning_curve.png`
 (navigation time, trailing success rate, Σ|ΔQ| convergence, ε decay).
 
 ```
@@ -197,22 +203,22 @@ Sim-side hooks (env vars, all no-ops in normal GUI use):
 failure), `SIM_SEED` (reproducibility), `SIM_CAPTURE=<path.gif>`
 (offscreen GIF capture: a side-by-side composite of the 3D view via
 TinyRenderer and the navigation map rendered through nav_map's own
-drawing code under Agg; route/trail drawn as real geometry since debug
-lines don't render offscreen, robot marked by its GO/STOP signal
-light; 8 fps, played back 2x, quantised to a run-wide shared palette).
+drawing code under Agg; the trail is drawn as real disc geometry since
+debug lines don't render offscreen (the route is not drawn at all,
+matching the live 3D view), robot marked by its GO/STOP signal light; 8 fps, played back 2x, quantised to a run-wide shared palette).
 Every run prints
 `RESULT success=… sim_time=… collisions=… near_misses=… go=… wait=…
 epsilon=… run=…`.
 
 **Measured baselines (2026-07-11), the portfolio pair:**
 - **Learning from scratch** — 100 unseeded episodes, blank table,
-  ε 0.30→0.05 (`learning_curve_from-scratch.png`): 100% success, mean
+  ε 0.30→0.05 (`evaluation/learning_curve_from-scratch.png`): 100% success, mean
   25.4s, 1 collision + 6 near-misses total, with 5 of 6 incident
   episodes inside the first 21 and **zero incidents in the final 50**.
   Early episodes update the table every crossing (Σ|ΔQ| ≈ 3 plateau);
   zero-update episodes become common late.
 - **Trained policy** — 100 unseeded episodes on the pre-trained table
-  (`learning_curve_trained-policy.png`): **100% success, mean 25.6s /
+  (`evaluation/learning_curve_trained-policy.png`): **100% success, mean 25.6s /
   median 25.5s (21.4–31.4s), 1 collision (0.01/ep, exploratory),
   4 near-misses, 53 GO / 41 WAIT**. All 8 reachable decision states
   learned; policy stable (Σ|ΔQ| oscillates ~1.2 from varying WAIT
@@ -263,7 +269,7 @@ policies are scored identically.
 Result (40 paired seeds): **both 40/40 success, 0 collisions, 0 near
 misses; mean crossing hold 0.49s (Q) vs 1.06s (rule)**. On the 23
 contested seeds: 0.85s vs 1.83s, a 54% delay reduction at equal safety.
-Q faster on 9 seeds, rule faster on 0, tied on 31. -> ab_comparison.png
+Q faster on 9 seeds, rule faster on 0, tied on 31. -> ab_comparison/ab_comparison.png
 
 **Round trip** (`SIM_RETURN=1`, opt-in). Gate -> depot by a different
 route: apron (offset lane) -> Gate A connector -> service road ->
