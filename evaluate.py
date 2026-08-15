@@ -8,8 +8,8 @@ reports:
 
   - success rate, and mean/median navigation time over successes
   - collision / near-miss / GO-WAIT decision totals
-  - a learning-curve figure        -> learning_curve.png
-  - raw per-episode records        -> eval_results.json
+  - a learning-curve figure        -> evaluation/learning_curve.png
+  - raw per-episode records        -> evaluation/eval_results.json
 
 The Q-table (q_table.json) persists across episodes -- that's the
 point: the harness measures how the agent improves as it accumulates
@@ -33,10 +33,14 @@ import sys
 BASE = os.path.dirname(os.path.abspath(__file__))
 SIM_FILE = os.path.join(BASE, "robot_sim.py")
 Q_FILE = os.path.join(BASE, "q_table.json")
-RESULTS_JSON = os.path.join(BASE, "eval_results.json")
-CURVE_PNG = os.path.join(BASE, "learning_curve.png")
-AB_JSON = os.path.join(BASE, "ab_comparison.json")
-AB_PNG = os.path.join(BASE, "ab_comparison.png")
+# Evaluation artefacts (records + learning curves) live together.
+EVAL_DIR = os.path.join(BASE, "evaluation")
+RESULTS_JSON = os.path.join(EVAL_DIR, "eval_results.json")
+CURVE_PNG = os.path.join(EVAL_DIR, "learning_curve.png")
+# A/B artefacts live together in their own folder.
+AB_DIR = os.path.join(BASE, "ab_comparison")
+AB_JSON = os.path.join(AB_DIR, "ab_comparison.json")
+AB_PNG = os.path.join(AB_DIR, "ab_comparison.png")
 
 # Palette (validated defaults): ink/chrome + one categorical hue for
 # data series, status-critical for failure marks. Single-hue on
@@ -394,10 +398,12 @@ def main():
     curve_png = CURVE_PNG
     if args.tag:
         safe_tag = re.sub(r"[^A-Za-z0-9_-]+", "-", args.tag)
-        results_json = os.path.join(BASE, f"eval_results_{safe_tag}.json")
-        curve_png = os.path.join(BASE, f"learning_curve_{safe_tag}.png")
+        results_json = os.path.join(EVAL_DIR, f"eval_results_{safe_tag}.json")
+        curve_png = os.path.join(EVAL_DIR, f"learning_curve_{safe_tag}.png")
 
+    os.makedirs(EVAL_DIR, exist_ok=True)
     if args.ab:
+        os.makedirs(AB_DIR, exist_ok=True)
         run_ab(args.ab, args.time_limit,
                args.seed_start if args.seed_start is not None else 1)
         return
