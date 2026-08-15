@@ -1185,42 +1185,16 @@ IDEAL_ROUTE_COLOR = [1, 0.85, 0]  # bold gold-yellow, solid (vs. the
                                    # road's dashed centerline) so the
                                    # two are still visually distinct
                                    # even though they overlap
-if SIM_RETURN:
-    # Draw the return route too, so both legs of the round trip are
-    # visible from the start. Slightly higher z than the gold line to
-    # avoid z-fighting where the two overlap on x=14.
-    for i in range(len(return_route) - 1):
-        p.addUserDebugLine(
-            [return_route[i][0], return_route[i][1], 0.016],
-            [return_route[i+1][0], return_route[i+1][1], 0.016],
-            lineColorRGB=RETURN_ROUTE_COLOR, lineWidth=4)
+# The planned routes are NOT drawn in the 3D view: the road network's
+# own dashed centrelines already show where the robot can go, and the
+# breadcrumb trail shows where it went. The navigation map still draws
+# both legs -- that is the view whose job is showing the plan.
+# IDEAL_ROUTE_COLOR / RETURN_ROUTE_COLOR are kept: the trail recolours
+# to the return colour at the gate.
 
-for i in range(len(drawn_route) - 1):
-    p.addUserDebugLine(
-        [drawn_route[i][0], drawn_route[i][1], 0.013],
-        [drawn_route[i+1][0], drawn_route[i+1][1], 0.013],
-        lineColorRGB=IDEAL_ROUTE_COLOR,
-        lineWidth=5
-    )
-
-# Capture mode: debug lines don't exist in offscreen software renders,
-# so draw the same ideal route again as thin gold box strips, and set
-# up the fixed capture camera.
+# Capture mode: set up the fixed capture camera. No route geometry is
+# drawn here either, matching the live 3D view.
 if SIM_CAPTURE:
-    for i in range(len(drawn_route) - 1):
-        x1, y1 = drawn_route[i]
-        x2, y2 = drawn_route[i + 1]
-        seg_len = math.hypot(x2 - x1, y2 - y1)
-        if seg_len == 0:
-            continue
-        strip = p.createVisualShape(
-            p.GEOM_BOX, halfExtents=[seg_len / 2, 0.07, 0.012],
-            rgbaColor=[1, 0.85, 0, 1])
-        p.createMultiBody(0, -1, strip,
-                          basePosition=[(x1 + x2) / 2, (y1 + y2) / 2, 0.014],
-                          baseOrientation=p.getQuaternionFromEuler(
-                              [0, 0, math.atan2(y2 - y1, x2 - x1)]))
-
     import numpy as np  # needed to snapshot frames (see capture loop)
 
     # Neutral ground cover: hides the default checkerboard plane in
