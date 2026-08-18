@@ -1,14 +1,13 @@
-# Project ARGO — Autonomous Airport Luggage Robot
+# Project ARGO — Autonomous Robot Ground Operations
 
 ![CI](https://github.com/swyou1214/airport-robot-sim/actions/workflows/ci.yml/badge.svg)
 
 A physics-based simulation of an autonomous luggage-transport robot in
-PyBullet. The robot navigates a multi-segment airport tarmac from a
-depot to a gated jetbridge bay, crossing four roads of moving traffic
-on the way — using pure-pursuit path tracking, predictive crossing
-safety, a reactive collision-recovery state machine, and a Q-learning
-agent that learns gap acceptance at the service-road crossing from its
-own experience, persisted across runs.
+PyBullet. The robot navigates a multi-segment airport taxiway with
+moving traffic using pure-pursuit tracking, predictive crossing safety,
+and a reactive collision-recovery state machine. A Q-learning agent
+learns gap acceptance at crossings from its own experience, persisted
+across runs.
 
 ![Demo run — 3D view and navigation view side by side, depot to gate.
 The light above the robot shows its drive command: green = GO, red =
@@ -27,6 +26,10 @@ episodes each):
 - **Trained policy**: 100% success, mean 25.6s, 0.01
   collisions/episode → `evaluation/learning_curve_trained-policy.png`
 
+The results show that the agent learns gap acceptance from scratch,
+converges to a stable policy and keeps the policy in subsequent runs
+whilst the safety layers ensure successful mission completion.
+
 ---
 
 ## Quick start
@@ -39,17 +42,18 @@ python evaluate.py             # run 20 headless episodes, print stats,
 ```
 
 Every run of `robot_sim.py` updates `q_table.json`, so the crossing
-agent keeps learning across runs — GUI and headless alike. That file
-is not tracked in git: a fresh clone starts from a blank table and
-trains its own, exactly as the from-scratch curve above shows. (The
-trained table those measurements ended on is preserved as
-`final_q_table` inside `evaluation/eval_results_trained-policy.json`.)
+agent continues learning across both GUI and headless runs. That file
+is not tracked in git: a fresh clone starts with a blank Q-table and
+trains its own, as shown by the from-scratch curve above. The final
+trained table is preserved as `final_q_table` inside
+`evaluation/eval_results_trained-policy.json`.
 
 ### GUI controls
 
-- **Arrow keys** — move the camera target (forward/back/strafe)
-- **Mouse drag / scroll** — rotate and zoom (PyBullet defaults);
-  keyboard and mouse control coexist
+- **Arrow keys** — move the camera target (forward/backward/strafe)
+- **Mouse drag / scroll** — hold Ctrl while dragging to rotate, and
+  scroll to zoom (PyBullet defaults)
+- Keyboard and mouse control coexist
 
 ### Navigation view
 
@@ -109,8 +113,8 @@ apron into the gate bay — via pure pursuit (1m lookahead).
 The two views divide the work: the **3D window** shows what the robot
 did (breadcrumb trails, red for robot 1 and blue for robot 2, switching
 to cyan on a return leg) against the road network's own dashed
-centrelines, while the **navigation map** shows the plan — both routes,
-drawn from the start and never repainted.
+centrelines, while the **navigation map** shows the plan — the route
+for the leg currently being driven.
 
 Each car's starting position and direction are **randomized every
 run**, so no two episodes present the same traffic timing. Set
@@ -291,14 +295,14 @@ from the live one.
 
 ```
 airport-robot/
-├── robot_sim.py            # the complete simulation (~1,890 lines)
+├── robot_sim.py            # the complete simulation (~2,490 lines)
 ├── nav_map.py              # 2D navigation map window (separate process)
-├── evaluate.py             # evaluation harness (~300 lines)
+├── evaluate.py             # evaluation harness (~480 lines)
 ├── q_table.json            # learned crossing policy (auto-generated, untracked)
 ├── learned_obstacles.json  # static-obstacle memory (auto-generated, untracked)
 ├── evaluation/             # eval records + learning curves (auto-generated)
 ├── ab_comparison/          # A/B records + comparison figure (auto-generated)
-├── docs/demo.gif           # captured demo run (SIM_CAPTURE)
+├── docs/                   # captured runs: demo.gif, two_robots.gif
 ├── README.md
 └── PROJECT_ARGO_SUMMARY.md # technical summary for development
 ```
@@ -326,16 +330,18 @@ GUI paces in real time.
 ## Tests & CI
 
 ```bash
-python -m pytest -v        # 13 tests, ~50s locally
+python -m pytest -v        # 17 tests, ~2 min locally
 ```
 
 - **Unit tests** — `nav_map`'s geometry (marker rotation, road
   polygons, view centring, zoom limits) and `evaluate`'s aggregation
   helpers (Q-table deltas, rolling success rate)
 - **End-to-end tests** — full headless episodes of `robot_sim.py`
-  (seeded and unseeded) asserting the robot reaches the gate, plus a
-  capped capture run asserting the composite GIF pipeline produces a
-  valid two-panel animation
+  (seeded and unseeded) asserting the robot reaches the gate; the round
+  trip returning to the depot and the fleet deploying a second robot,
+  each with a check that the feature stays opt-in; and a capped capture
+  run asserting the composite GIF pipeline produces a valid two-panel
+  animation
 
 GitHub Actions runs the same suite on every push and pull request
 (`.github/workflows/ci.yml`). `robot_sim.py`'s internals (A*,
@@ -349,8 +355,9 @@ episodes; direct unit tests for them await the planned module split.
   predictive rule
 - No same-lane traffic handling (the taxiway is kept car-free by
   design; there is no overtaking behavior)
-- Single robot; adding a second would need a dispatcher for shared
-  connectors
+- Two robots run without a dispatcher: they stay out of phase by
+  construction, so they never contest the shared taxiway. A third
+  robot, or different deployment timing, would need real coordination
 - The robot reads car positions from the physics engine directly — no
   simulated sensors or noise
 - With ε floored at 0.05, rarely-visited Q-states fill in slowly
