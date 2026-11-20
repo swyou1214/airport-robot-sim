@@ -15,8 +15,51 @@ STOP. Watch both panels at the service-road crossing: the light turns
 red, the map banner reads STOP, and the readout drops to 0.0
 m/s.](docs/demo.gif)
 
-**Measured performance** (automated evaluation harness, 100 randomized
-episodes each):
+## The problem
+
+Airside baggage robots have to cross roads that carry live vehicle
+traffic. At each crossing the robot faces a **gap-acceptance** decision:
+is the space between it and the next vehicle big enough to go now, or
+should it wait?
+
+The usual answer is a hand-tuned rule — "go only if every car is at
+least *T* seconds away". A rule like that is easy to reason about, but
+it is blind to context, so it has to be tuned for the worst case. That
+makes it **safe but slow**: it holds the robot for gaps that were never
+dangerous, and at an airport those seconds add up across every robot,
+every crossing, every turnaround.
+
+The difficulty is that distance alone doesn't determine safety. A 6m
+gap *behind* a car driving away is safe; the same 6m gap *in front of*
+an approaching car is a near-miss. A distance threshold can't tell those
+apart, so it must refuse both.
+
+**ARGO asks: can the robot learn a less conservative crossing policy
+from its own experience, without giving up safety?**
+
+## The result
+
+At the service-road crossing, a Q-learning agent replaces the fixed
+rule. Its state pairs the gap to the nearest car with whether that car
+is approaching or receding, and each crossing is scored on what actually
+happened — how close any car came — not on a prediction made beforehand.
+
+**Learned policy vs. fixed rule** — the same 40 traffic seeds, each run
+under both controllers so traffic timing is identical:
+
+| | Learned policy | Fixed rule |
+|---|---|---|
+| Missions completed | 40 / 40 | 40 / 40 |
+| Collisions / near-misses | 0 / 0 | 0 / 0 |
+| Mean hold at the crossing | **0.49s** | 1.06s |
+| Mean hold, seeds with traffic in play (23 of 40) | **0.85s** | 1.83s |
+| Seeds where this policy was faster | 9 | 0 |
+
+**Same safety record, 54% less waiting** on the crossings where traffic
+actually mattered — and the learned policy was never slower than the
+rule on any seed → `ab_comparison/ab_comparison.png`
+
+**Learning and steady state** (100 randomized episodes each):
 
 - **Learning from scratch** (blank Q-table): 100% navigation success,
   mean 25.4s depot-to-gate — with every collision/near-miss
@@ -26,9 +69,12 @@ episodes each):
 - **Trained policy**: 100% success, mean 25.6s, 0.01
   collisions/episode → `evaluation/learning_curve_trained-policy.png`
 
-The results show that the agent learns gap acceptance from scratch,
-converges to a stable policy and keeps the policy in subsequent runs
-whilst the safety layers ensure successful mission completion.
+The agent learns gap acceptance from scratch, converges to a stable
+policy and keeps it in subsequent runs, while the rule-based guards on
+the other roads and collision recovery ensure every mission completes.
+
+The result is evidence that the approach works in simulation, not that
+it is ready to deploy — see [Known limitations](#known-limitations).
 
 ---
 
@@ -254,6 +300,7 @@ python evaluate.py --fresh          # wipe q_table.json first
 python evaluate.py --seed-start 1   # reproducible seeds 1..N
 python evaluate.py --time-limit 180 # per-episode sim-time cap
 python evaluate.py --tag baseline   # label outputs: learning_curve_baseline.png
+python evaluate.py --ab 40          # paired A/B: learned policy vs fixed rule
 ```
 
 Each episode runs `robot_sim.py` headless in a fresh subprocess and
@@ -263,6 +310,18 @@ decisions, then the harness aggregates everything into:
 - `evaluation/learning_curve.png` — navigation time, trailing success rate,
   Q-table convergence (Σ|ΔQ| per episode), and ε decay
 - `evaluation/eval_results.json` — raw per-episode records + final Q-table
+
+`--ab N` runs seeds 1..N (or from `--seed-start`) twice each — once with
+the learned policy frozen and greedy (`SIM_FREEZE_Q=1`), once with the
+rule baseline (`SIM_CROSSING=rule`) — and writes
+`ab_comparison/ab_comparison.json` + `ab_comparison.png`. It freezes
+whatever `q_table.json` you currently have, so on a fresh clone train a
+policy first:
+
+```bash
+python evaluate.py -n 100           # train a policy
+python evaluate.py --ab 40          # then compare it against the rule
+```
 
 Environment hooks (used by the harness, available manually too):
 

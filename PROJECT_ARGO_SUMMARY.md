@@ -1,7 +1,7 @@
 # Project ARGO — Development Summary
-*Technical summary for development continuation. Supersedes the
-2026-07 handoff version (which described the pre-evaluation-harness
-architecture).*
+*Technical summary for development continuation. Last updated
+2026-11. Supersedes the 2026-07 handoff version (which described the
+pre-evaluation-harness architecture).*
 
 ---
 
@@ -12,6 +12,19 @@ robot built in PyBullet (Python 3.10). The robot navigates a
 multi-segment airport tarmac from a depot to a gated jetbridge bay,
 crossing randomized moving traffic, recovering from collisions, and
 *learning* gap acceptance at one crossing via Q-learning.
+
+**The problem it addresses:** hand-tuned crossing rules ("go only if
+every car is ≥ T seconds away") must be tuned for the worst case, so
+they are safe but slow — they hold the robot for gaps that were never
+dangerous. Distance alone can't separate a safe gap (behind a receding
+car) from a near-miss (in front of an approaching one). ARGO tests
+whether a learned policy can cut that waiting without giving up safety.
+
+**Headline result** (paired A/B, 40 seeds, identical traffic per pair —
+see *Round trip + A/B* below): learned policy and rule both 40/40
+success with 0 collisions / 0 near-misses; mean crossing hold 0.49s vs
+1.06s, and 0.85s vs 1.83s (−54%) on the 23 contested seeds. The README
+now leads with this framing (*The problem* / *The result* sections).
 
 Goals:
 1. A portfolio piece demonstrating autonomous navigation, RL, and
@@ -25,12 +38,17 @@ Goals:
 
 ```
 airport-robot/
-├── robot_sim.py            # Main simulation (~1,760 lines)
-├── evaluate.py             # Evaluation harness (~300 lines)
+├── robot_sim.py            # Main simulation (~2,490 lines)
+├── nav_map.py              # 2D navigation map window, separate process (~390 lines)
+├── evaluate.py             # Evaluation harness + paired A/B (~480 lines)
+├── requirements.txt        # pybullet 3.2.7, numpy, matplotlib, pillow
 ├── q_table.json            # Q-learning state, persists across runs (auto-generated, gitignored)
-├── learned_obstacles.json  # Static-obstacle memory (auto-generated)
-├── evaluation/             # Eval records + learning curves (auto-generated)
-├── ab_comparison/          # A/B records + figure (auto-generated)
+├── learned_obstacles.json  # Static-obstacle memory (auto-generated, gitignored)
+├── evaluation/             # Eval records + learning curves (committed portfolio artifacts)
+├── ab_comparison/          # A/B records + figure (committed)
+├── docs/                   # Captured runs: demo.gif, two_robots.gif
+├── tests/                  # pytest suite (17 tests: unit + headless end-to-end)
+├── .github/workflows/ci.yml# CI: runs the suite on every push / PR
 ├── README.md               # User-facing documentation
 └── PROJECT_ARGO_SUMMARY.md # This file
 ```
@@ -41,7 +59,11 @@ airport-robot/
   (`p.setTimeStep(1/480)`, matched to the loop's 1/480 bookkeeping so
   the GUI runs in real time)
 - **Python 3.10** in `venv310`
-- **Matplotlib** — used by the evaluation harness for learning curves
+- **Matplotlib** — evaluation learning curves, the A/B figure, and the
+  live navigation map (`nav_map.py`, its own process fed over a
+  non-blocking pipe so a ~60ms redraw never stalls the 480 Hz loop)
+- **NumPy + Pillow** — frame snapshots and GIF encoding for
+  `SIM_CAPTURE` only
 - No external ML libraries — all algorithms implemented from scratch
 
 **macOS 15 install note:** PyBullet's vendored zlib conflicts with the
@@ -196,6 +218,7 @@ episode, and writes `evaluation/eval_results.json` + `learning_curve.png`
 
 ```
 python evaluate.py [-n N] [--fresh] [--seed-start K] [--time-limit S] [--tag NAME]
+python evaluate.py --ab N [--seed-start K]   # paired A/B, see below
 ```
 
 Sim-side hooks (env vars, all no-ops in normal GUI use):
@@ -270,6 +293,15 @@ Result (40 paired seeds): **both 40/40 success, 0 collisions, 0 near
 misses; mean crossing hold 0.49s (Q) vs 1.06s (rule)**. On the 23
 contested seeds: 0.85s vs 1.83s, a 54% delay reduction at equal safety.
 Q faster on 9 seeds, rule faster on 0, tied on 31. -> ab_comparison/ab_comparison.png
+(Contested = either arm held > 0.05s; faster/tied use the same 0.05s
+margin. Figures re-verified against ab_comparison.json, 2026-11.)
+
+**Reproducibility caveat:** both arms run with `SIM_FREEZE_Q=1`, and the
+Q arm freezes whatever `q_table.json` is on disk. That file is
+gitignored, so `--ab` on a fresh clone compares a *blank* table against
+the rule and will not reproduce the numbers above. The README tells
+users to train first (`evaluate.py -n 100`); a proper fix is listed in
+*Suggested next steps*.
 
 **Round trip** (`SIM_RETURN=1`, opt-in). Gate -> depot by a different
 route: apron (offset lane) -> Gate A connector -> service road ->
@@ -372,6 +404,10 @@ GAP_BUCKETS = [3, 5, 7, 9]  # Q-state distance boundaries (m)
 ## Suggested next steps
 
 ### High priority
+- [ ] **Make the A/B reproducible from a clone** — let `--ab` load the
+      committed `final_q_table` from
+      `evaluation/eval_results_trained-policy.json` (e.g. a
+      `--q-from <file>` flag) instead of the gitignored `q_table.json`
 - [ ] **Harness `--explore` flag** — temporarily raise ε to fill the
       remaining zero Q-states, then re-freeze
 - [ ] **Multi-crossing Q-learning** — extend the agent to the apron
@@ -396,6 +432,9 @@ GAP_BUCKETS = [3, 5, 7, 9]  # Q-state distance boundaries (m)
       q_state -- robot_sim.py executes at import, so those need the
       module split first (they're covered indirectly by the
       end-to-end episodes meanwhile)
+- [x] **README problem framing** — *The problem* / *The result*
+      sections lead with the gap-acceptance problem and the A/B table;
+      `--ab` documented in the harness section (2026-11)
 - [x] **Screen recording / GIF** — `docs/demo.gif` (seed 205: clean
       run with a learned WAIT at the service-road crossing), captured
       via the `SIM_CAPTURE` hook
