@@ -57,7 +57,12 @@ under both controllers so traffic timing is identical:
 
 **Same safety record, 54% less waiting** on the crossings where traffic
 actually mattered — and the learned policy was never slower than the
-rule on any seed → `ab_comparison/ab_comparison.png`
+rule on any seed → `ab_comparison/ab_comparison.png`. A fresh clone
+can re-run it from the committed trained table (~10 min):
+`python evaluate.py --ab 40 --q-from evaluation/eval_results_trained-policy.json`.
+A re-run makes the same decision on every seed; per-seed timings can
+differ by a few hundredths of a second, which can move one borderline
+seed across the 0.05s "contested" cut-off.
 
 **Learning and steady state** (100 randomized episodes each):
 
@@ -301,6 +306,8 @@ python evaluate.py --seed-start 1   # reproducible seeds 1..N
 python evaluate.py --time-limit 180 # per-episode sim-time cap
 python evaluate.py --tag baseline   # label outputs: learning_curve_baseline.png
 python evaluate.py --ab 40          # paired A/B: learned policy vs fixed rule
+python evaluate.py --ab 40 --q-from evaluation/eval_results_trained-policy.json
+                                    # same, on the committed trained table
 ```
 
 Each episode runs `robot_sim.py` headless in a fresh subprocess and
@@ -314,14 +321,21 @@ decisions, then the harness aggregates everything into:
 `--ab N` runs seeds 1..N (or from `--seed-start`) twice each — once with
 the learned policy frozen and greedy (`SIM_FREEZE_Q=1`), once with the
 rule baseline (`SIM_CROSSING=rule`) — and writes
-`ab_comparison/ab_comparison.json` + `ab_comparison.png`. It freezes
-whatever `q_table.json` you currently have, so on a fresh clone train a
-policy first:
+`ab_comparison/ab_comparison.json` + `ab_comparison.png`.
+
+By default the learned arm uses whatever `q_table.json` you currently
+have. `--q-from FILE` evaluates the table in FILE instead — a
+`q_table.json`, or an `eval_results_*.json` record with a
+`final_q_table` — and leaves your own `q_table.json` untouched. That is
+how a fresh clone, which has no `q_table.json`, reproduces the result
+above from the committed trained table:
 
 ```bash
-python evaluate.py -n 100           # train a policy
-python evaluate.py --ab 40          # then compare it against the rule
+python evaluate.py --ab 40 --q-from evaluation/eval_results_trained-policy.json
 ```
+
+A missing, malformed or all-zero table is rejected before any episode
+runs, rather than silently measuring an untrained policy.
 
 Environment hooks (used by the harness, available manually too):
 
@@ -336,6 +350,7 @@ Environment hooks (used by the harness, available manually too):
 | `SIM_ROBOTS=2` | deploy a second robot when the first turns for home (needs `SIM_RETURN`) |
 | `SIM_CROSSING=rule` | hand the service-road crossing to the rule baseline |
 | `SIM_FREEZE_Q=1` | greedy evaluation: no exploration, no Q updates |
+| `SIM_Q_FILE=<path>` | use the Q-table at *path* instead of `q_table.json` (an unreadable or wrong-layout file is an error) |
 
 The README demo was captured with:
 
@@ -389,16 +404,20 @@ GUI paces in real time.
 ## Tests & CI
 
 ```bash
-python -m pytest -v        # 17 tests, ~2 min locally
+python -m pytest -v        # 29 tests, ~2 min locally
 ```
 
 - **Unit tests** — `nav_map`'s geometry (marker rotation, road
-  polygons, view centring, zoom limits) and `evaluate`'s aggregation
-  helpers (Q-table deltas, rolling success rate)
+  polygons, view centring, zoom limits) and `evaluate`'s helpers
+  (Q-table deltas, rolling success rate, and the `--q-from` loader,
+  including rejection of missing, malformed and untrained tables)
 - **End-to-end tests** — full headless episodes of `robot_sim.py`
   (seeded and unseeded) asserting the robot reaches the gate; the round
   trip returning to the depot and the fleet deploying a second robot,
-  each with a check that the feature stays opt-in; and a capped capture
+  each with a check that the feature stays opt-in; `SIM_Q_FILE` driving
+  the crossing decision both ways (an all-WAIT and an all-GO table)
+  without touching `q_table.json`, and a bad table stopping the run;
+  and a capped capture
   run asserting the composite GIF pipeline produces a valid two-panel
   animation
 

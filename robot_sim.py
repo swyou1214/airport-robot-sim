@@ -37,8 +37,17 @@ SIM_TIME_LIMIT = float(os.environ.get("SIM_TIME_LIMIT", "0"))
 #                          written to q_table.json. Without this, an
 #                          A/B measures exploration noise and the
 #                          policy drifts mid-comparison.
+#   SIM_Q_FILE=<path>   -> read (and, unless frozen, write) the Q-table
+#                          at <path> instead of q_table.json. Lets the
+#                          A/B evaluate a committed table on a fresh
+#                          clone, where q_table.json doesn't exist. A
+#                          missing or wrong-layout file here is an
+#                          error, never a silent fallback to a blank
+#                          table -- that would quietly measure an
+#                          untrained policy.
 SIM_CROSSING = os.environ.get("SIM_CROSSING", "q").lower()
 SIM_FREEZE_Q = os.environ.get("SIM_FREEZE_Q") == "1"
+SIM_Q_FILE = os.environ.get("SIM_Q_FILE") or None
 
 #   SIM_RETURN=1 -> after reaching the gate, drive back to the depot by
 #                   a DIFFERENT route (see return_route below) instead
@@ -646,7 +655,8 @@ def update_cars(dt):
 # Q(small_gap, WAIT) becomes positive -- and the robot's
 # crossing behaviour visibly improves.
 
-Q_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "q_table.json")
+Q_FILE = SIM_Q_FILE or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "q_table.json")
 
 # Gap buckets: distance from nearest car to the crossing point (metres)
 GAP_BUCKETS = [3.0, 5.0, 7.0, 9.0]  # boundaries; 5 distance buckets,
@@ -663,6 +673,20 @@ Q_EPSILON_MIN   = 0.05  # never go fully greedy
 
 def load_q_table():
     n_states = (len(GAP_BUCKETS) + 1) * 2  # gap buckets x car direction
+    if SIM_Q_FILE:
+        # An explicitly chosen table must load as-is (see SIM_Q_FILE).
+        try:
+            with open(Q_FILE) as f:
+                data = json.load(f)
+            table = data["q_table"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+            raise SystemExit(f"SIM_Q_FILE={Q_FILE!r} is not a readable "
+                             f"Q-table: {e}")
+        if len(table) != n_states or any(len(row) != 2 for row in table):
+            raise SystemExit(f"SIM_Q_FILE={Q_FILE!r} has the wrong layout: "
+                             f"expected {n_states} states x 2 actions")
+        return (table, data.get("epsilon", Q_EPSILON_MIN),
+                data.get("run_count", 0), data.get("total_crossings", 0))
     if os.path.exists(Q_FILE):
         try:
             with open(Q_FILE) as f:
@@ -916,6 +940,7 @@ if SIM_FREEZE_Q:
 print(f"Q-learning: run #{q_run_count}, ε={q_epsilon:.2f}, "
       f"{q_total_crossings} crossings learned so far"
       + ("  [FROZEN: greedy, no updates]" if SIM_FREEZE_Q else "")
+      + (f"  [Q-table: {SIM_Q_FILE}]" if SIM_Q_FILE else "")
       + (f"  [crossing controller: {SIM_CROSSING.upper()}]"
          if SIM_CROSSING != "q" else ""))
 bucket_labels = ["0-3m", "3-5m", "5-7m", "7-9m", "9m+"]
