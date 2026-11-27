@@ -45,9 +45,24 @@ SIM_TIME_LIMIT = float(os.environ.get("SIM_TIME_LIMIT", "0"))
 #                          error, never a silent fallback to a blank
 #                          table -- that would quietly measure an
 #                          untrained policy.
+#   SIM_EXPLORE=1       -> directed exploration (see `evaluate.py
+#                          --explore`): at a crossing decision, if the
+#                          current state has an action that has never
+#                          been tried (its Q-value is still exactly
+#                          0.0), take that action; otherwise act
+#                          epsilon-greedy as usual. At epsilon's 0.05
+#                          floor a rarely visited state would otherwise
+#                          almost never try its other action, so its
+#                          untried value of 0 could lose the argmax
+#                          forever. Learning stays on, so this can't be
+#                          combined with SIM_FREEZE_Q.
 SIM_CROSSING = os.environ.get("SIM_CROSSING", "q").lower()
 SIM_FREEZE_Q = os.environ.get("SIM_FREEZE_Q") == "1"
 SIM_Q_FILE = os.environ.get("SIM_Q_FILE") or None
+SIM_EXPLORE = os.environ.get("SIM_EXPLORE") == "1"
+if SIM_EXPLORE and SIM_FREEZE_Q:
+    raise SystemExit("SIM_EXPLORE=1 learns from what it tries, so it "
+                     "can't be combined with SIM_FREEZE_Q=1")
 
 #   SIM_RETURN=1 -> after reaching the gate, drive back to the depot by
 #                   a DIFFERENT route (see return_route below) instead
@@ -918,8 +933,21 @@ CROSSING_COMMIT_MARGIN = 1.0  # within this distance of the road centre the
                               # window (extending 0.5m PAST the road) did.
 CROSSING_X = 14.0
 
+def untried_action(state):
+    """The action this state has never tried (Q exactly 0.0), or None.
+    With both untried, WAIT first -- the cautious one."""
+    for action in (ACTION_WAIT, ACTION_GO):
+        if q_table[state][action] == 0.0:
+            return action
+    return None
+
 def choose_action(state, epsilon):
-    """ε-greedy action selection."""
+    """ε-greedy action selection; under SIM_EXPLORE, an untried action
+    in this state is taken first."""
+    if SIM_EXPLORE:
+        action = untried_action(state)
+        if action is not None:
+            return action
     if random.random() < epsilon:
         return random.choice([ACTION_WAIT, ACTION_GO])  # explore
     # Exploit: pick action with highest Q-value; default to GO on tie
@@ -940,6 +968,7 @@ if SIM_FREEZE_Q:
 print(f"Q-learning: run #{q_run_count}, ε={q_epsilon:.2f}, "
       f"{q_total_crossings} crossings learned so far"
       + ("  [FROZEN: greedy, no updates]" if SIM_FREEZE_Q else "")
+      + ("  [EXPLORE: untried actions first]" if SIM_EXPLORE else "")
       + (f"  [Q-table: {SIM_Q_FILE}]" if SIM_Q_FILE else "")
       + (f"  [crossing controller: {SIM_CROSSING.upper()}]"
          if SIM_CROSSING != "q" else ""))
@@ -1986,6 +2015,8 @@ while True:
                         # latches stop it being re-made every frame while the
                         # robot is still inside the zone.
                         current_state = q_state(gap, car_approaching)
+                        explored = (SIM_EXPLORE and
+                                    untried_action(current_state) is not None)
                         action = choose_action(current_state, q_epsilon)
                         r.q_current_state = current_state
                         r.q_current_action = action
@@ -1999,7 +2030,8 @@ while True:
                             print(f"Q-agent: GAP={gap:.1f}m "
                                   f"{'closing' if car_approaching else 'receding'} "
                                   f"({state_label(current_state)}) "
-                                  f"-> WAIT  [ε={q_epsilon:.2f}]")
+                                  f"-> WAIT  [ε={q_epsilon:.2f}]"
+                                  f"{'  [untried]' if explored else ''}")
                             for joint in WHEEL_JOINTS:
                                 p.setJointMotorControl2(r.body, joint, p.VELOCITY_CONTROL,
                                                          targetVelocity=0, force=15)
@@ -2014,7 +2046,8 @@ while True:
                             print(f"Q-agent: GAP={gap:.1f}m "
                                   f"{'closing' if car_approaching else 'receding'} "
                                   f"({state_label(current_state)}) "
-                                  f"-> GO  [ε={q_epsilon:.2f}]")
+                                  f"-> GO  [ε={q_epsilon:.2f}]"
+                                  f"{'  [untried]' if explored else ''}")
 
                     elif r.state == STATE_WAITING:
                         # Accumulate waiting cost (small penalty per second)

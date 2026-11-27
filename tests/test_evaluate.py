@@ -76,3 +76,36 @@ def test_load_q_source_rejects_unusable_tables(tmp_path, data):
 def test_load_q_source_rejects_missing_file(tmp_path):
     with pytest.raises(ValueError):
         ev.load_q_source(tmp_path / "nope.json")
+
+
+# ---- --explore: which actions are still untried ----
+
+def test_untried_pairs_finds_zero_actions():
+    table = [[0.0, 3.0], [2.0, -1.0], [1.0, 0.0], [0.0, 0.0],
+             [0.0, 0.0], [0.0, 0.0]]
+    assert ev.untried_pairs(table) == [(0, 0), (2, 1), (3, 0), (3, 1)]
+
+
+def test_untried_pairs_skips_the_never_consulted_9m_states():
+    """The last two states (9m+) are never consulted, so their zeros
+    aren't gaps exploration can fill."""
+    table = [[1.0, 2.0]] * 8 + [[0.0, 0.0], [0.0, 0.0]]
+    assert ev.untried_pairs(table) == []
+
+
+def test_untried_pairs_on_committed_trained_table():
+    table = ev.load_q_source(
+        ROOT / "evaluation" / "eval_results_trained-policy.json")
+    for s, a in ev.untried_pairs(table):
+        assert table[s][a] == 0.0 and s < 8
+
+
+def test_greedy_policy_breaks_ties_toward_go():
+    assert ev.greedy_policy([[1.0, 2.0], [3.0, 1.0], [0.0, 0.0]]) == \
+        ["GO", "WAIT", "GO"]
+
+
+def test_state_name_matches_sim_labels():
+    assert ev.state_name(0) == "0-3m rcdg"
+    assert ev.state_name(7) == "7-9m appr"
+    assert ev.state_name(9) == "9m+ appr"

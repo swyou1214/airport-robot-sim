@@ -139,3 +139,37 @@ def test_sim_q_file_rejects_a_bad_table(tmp_path):
                           cwd=str(ROOT), timeout=300)
     assert proc.returncode != 0
     assert "wrong layout" in proc.stderr
+
+
+def test_sim_explore_takes_the_untried_action(tmp_path):
+    """SIM_EXPLORE is what `evaluate.py --explore` runs: a state whose
+    action has never been tried (Q exactly 0.0) must try it, even when
+    the greedy choice is the other one. The table prefers GO everywhere
+    with WAIT untried, so seed 205's contested crossing must WAIT, and
+    learning (on, unlike a frozen run) must give WAIT a value."""
+    table = tmp_path / "q_explore.json"
+    table.write_text(json.dumps({"q_table": [[0.0, 5.0] for _ in range(10)],
+                                 "epsilon": 0.0}))
+    q_json = ROOT / "q_table.json"
+    before = q_json.read_bytes() if q_json.exists() else None
+    result = run_sim({"SIM_SEED": "205", "SIM_TIME_LIMIT": "150",
+                      "SIM_EXPLORE": "1", "SIM_Q_FILE": str(table)})
+    assert result["success"] == "1"
+    assert int(result["wait"]) >= 1
+    learned = json.loads(table.read_text())["q_table"]
+    assert any(row[0] != 0.0 for row in learned)
+    after = q_json.read_bytes() if q_json.exists() else None
+    assert after == before
+
+
+def test_sim_explore_refuses_a_frozen_run():
+    """Exploring means learning from what was tried; a frozen run
+    can't learn, so the combination must stop instead of doing half."""
+    env = os.environ.copy()
+    env.update({"SIM_HEADLESS": "1", "SIM_TIME_LIMIT": "5",
+                "SIM_EXPLORE": "1", "SIM_FREEZE_Q": "1"})
+    proc = subprocess.run([sys.executable, str(ROOT / "robot_sim.py")],
+                          capture_output=True, text=True, env=env,
+                          cwd=str(ROOT), timeout=300)
+    assert proc.returncode != 0
+    assert "SIM_FREEZE_Q" in proc.stderr

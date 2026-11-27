@@ -47,7 +47,7 @@ airport-robot/
 ├── evaluation/             # Eval records + learning curves (committed portfolio artifacts)
 ├── ab_comparison/          # A/B records + figure (committed)
 ├── docs/                   # Captured runs: demo.gif, two_robots.gif
-├── tests/                  # pytest suite (29 tests: unit + headless end-to-end)
+├── tests/                  # pytest suite (36 tests: unit + headless end-to-end)
 ├── .github/workflows/ci.yml# CI: runs the suite on every push / PR
 ├── README.md               # User-facing documentation
 └── PROJECT_ARGO_SUMMARY.md # This file
@@ -219,6 +219,7 @@ episode, and writes `evaluation/eval_results.json` + `learning_curve.png`
 ```
 python evaluate.py [-n N] [--fresh] [--seed-start K] [--time-limit S] [--tag NAME]
 python evaluate.py --ab N [--seed-start K] [--q-from FILE]   # paired A/B, see below
+python evaluate.py --explore N [--seed-start K]              # fill never-tried actions
 ```
 
 Sim-side hooks (env vars, all no-ops in normal GUI use):
@@ -387,13 +388,24 @@ caused the same flicker by swapping z-order every frame.
 4. **No sensor simulation** — perfect state via PyBullet API.
 5. **`smooth_path` can still cut corners** where short apron segments
    are geometrically close.
-6. **ε floor (0.05) fills rare states slowly** — a harness `--explore`
-   flag (temporarily raised ε) would speed up covering the remaining
-   zero-valued states.
-7. **"7–9m receding" prefers WAIT only because GO was never sampled
-   there** at ε=0.05 — harmless (the predictive release crosses almost
-   immediately anyway), but it's the visible case for the `--explore`
-   flag.
+6. **ε floor (0.05) fills rare states slowly.** `--explore N` now
+   covers this. With `SIM_EXPLORE=1`, the agent takes a state's
+   never-tried action whenever it reaches that state. On the run-276
+   table it filled all four gaps (0–3m, 3–5m and 5–7m receding WAIT;
+   7–9m receding GO) in 19 episodes, and the greedy policy didn't
+   change.
+7. **WAIT values are inflated relative to GO.** The 7–9m receding
+   state still prefers WAIT after GO was tried there (WAIT +75.35 vs GO
+   +3.00), so lack of samples wasn't the reason. The update is
+   asymmetric. A WAIT resolves while a car is still nearby, so it
+   bootstraps on that state's high max (γ·max Q(s')). A GO resolves
+   after the robot has cleared the road, when the next state is usually
+   9m+, which is never consulted and stays 0. So one safe GO earns 0.3 ×
+   10 = 3.0, while WAIT compounds towards 10/(1−γ). This is harmless in
+   practice, because the predictive release crosses almost immediately.
+   But it biases the learned policy towards WAIT. Treating each crossing
+   as terminal (no bootstrap) for both actions would compare them
+   fairly.
 
 ---
 
@@ -424,8 +436,13 @@ GAP_BUCKETS = [3, 5, 7, 9]  # Q-state distance boundaries (m)
       evaluation/eval_results_trained-policy.json` evaluates the
       committed `final_q_table` via `SIM_Q_FILE`, leaving the gitignored
       `q_table.json` untouched (2026-11)
-- [ ] **Harness `--explore` flag** — temporarily raise ε to fill the
-      remaining zero Q-states, then re-freeze
+- [x] **Harness `--explore` flag** — `--explore N` runs learning
+      episodes with `SIM_EXPLORE=1` (never-tried actions first) until
+      every consulted state has tried both, then reports greedy-policy
+      changes for a frozen `--ab` re-measure (2026-11)
+- [ ] **Terminal crossing reward** — stop bootstrapping the
+      crossing update so WAIT and GO compete on equal terms (see
+      limitation 7)
 - [ ] **Multi-crossing Q-learning** — extend the agent to the apron
       roads (shared table keyed by road, or add car speed to state)
 - [x] **Larger evaluation batches** — 100-episode trained-policy run

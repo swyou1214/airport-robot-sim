@@ -308,6 +308,7 @@ python evaluate.py --tag baseline   # label outputs: learning_curve_baseline.png
 python evaluate.py --ab 40          # paired A/B: learned policy vs fixed rule
 python evaluate.py --ab 40 --q-from evaluation/eval_results_trained-policy.json
                                     # same, on the committed trained table
+python evaluate.py --explore 30     # try every never-tried crossing action
 ```
 
 Each episode runs `robot_sim.py` headless in a fresh subprocess and
@@ -337,6 +338,16 @@ python evaluate.py --ab 40 --q-from evaluation/eval_results_trained-policy.json
 A missing, malformed or all-zero table is rejected before any episode
 runs, rather than silently measuring an untrained policy.
 
+`--explore N` fills the gaps the ε floor leaves. At ε = 0.05 a rarely
+visited state almost never tries its other action, so that action keeps
+its starting value of 0 indefinitely. In explore mode (`SIM_EXPLORE=1`)
+the agent takes a state's never-tried action whenever it reaches that
+state. Learning stays on and `q_table.json` is updated. The run stops as
+soon as every consulted state has tried both actions, or after N
+episodes, and prints which greedy choices changed. The A/B then
+re-measures the policy frozen. (The 9m+ states are never consulted, so
+they stay 0 by design.)
+
 Environment hooks (used by the harness, available manually too):
 
 | Variable | Effect |
@@ -351,6 +362,7 @@ Environment hooks (used by the harness, available manually too):
 | `SIM_CROSSING=rule` | hand the service-road crossing to the rule baseline |
 | `SIM_FREEZE_Q=1` | greedy evaluation: no exploration, no Q updates |
 | `SIM_Q_FILE=<path>` | use the Q-table at *path* instead of `q_table.json` (an unreadable or wrong-layout file is an error) |
+| `SIM_EXPLORE=1` | take a state's never-tried action first, then ε-greedy (can't combine with `SIM_FREEZE_Q`) |
 
 The README demo was captured with:
 
@@ -404,19 +416,22 @@ GUI paces in real time.
 ## Tests & CI
 
 ```bash
-python -m pytest -v        # 29 tests, ~2 min locally
+python -m pytest -v        # 36 tests, ~2 min locally
 ```
 
 - **Unit tests** — `nav_map`'s geometry (marker rotation, road
   polygons, view centring, zoom limits) and `evaluate`'s helpers
-  (Q-table deltas, rolling success rate, and the `--q-from` loader,
-  including rejection of missing, malformed and untrained tables)
+  (Q-table deltas, rolling success rate, the `--q-from` loader
+  including rejection of missing, malformed and untrained tables, and
+  `--explore`'s untried-action and greedy-policy checks)
 - **End-to-end tests** — full headless episodes of `robot_sim.py`
   (seeded and unseeded) asserting the robot reaches the gate; the round
   trip returning to the depot and the fleet deploying a second robot,
   each with a check that the feature stays opt-in; `SIM_Q_FILE` driving
   the crossing decision both ways (an all-WAIT and an all-GO table)
   without touching `q_table.json`, and a bad table stopping the run;
+  `SIM_EXPLORE` taking a never-tried WAIT over a greedy GO, and refusing
+  to run frozen;
   and a capped capture
   run asserting the composite GIF pipeline produces a valid two-panel
   animation
