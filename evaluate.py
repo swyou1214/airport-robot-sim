@@ -24,6 +24,7 @@ Usage:
   python evaluate.py --ab 40          # paired A/B vs the rule baseline
   python evaluate.py --ab 40 --q-from evaluation/eval_results_trained-policy.json
                                       # A/B on the committed trained table
+  python evaluate.py --explore 30     # fill never-tried Q-state actions
 """
 import argparse
 import json
@@ -150,6 +151,91 @@ def rolling_success(successes, window=10):
         chunk = successes[lo:i + 1]
         rates.append(100.0 * sum(chunk) / len(chunk))
     return rates
+
+
+GAP_LABELS = ["0-3m", "3-5m", "5-7m", "7-9m", "9m+"]
+
+
+def state_name(s):
+    """Mirror of robot_sim.state_label (that module runs a whole
+    episode at import, so it can't be imported here)."""
+    return f"{GAP_LABELS[s // 2]} {'appr' if s % 2 else 'rcdg'}"
+
+
+def untried_pairs(table):
+    """(state, action) pairs the agent has never tried: Q exactly 0.0.
+    The 9m+ states (the table's last two) are left out -- the sim never
+    consults the agent when the nearest car is that far away, so they
+    stay 0 by design. action is 0 for WAIT, 1 for GO."""
+    return [(s, a) for s, row in enumerate(table[:-2])
+            for a, value in enumerate(row) if value == 0.0]
+
+
+def greedy_policy(table):
+    """The frozen policy's choice per state: GO unless WAIT is strictly
+    higher (robot_sim.choose_action breaks ties toward GO)."""
+    return ["GO" if row[1] >= row[0] else "WAIT" for row in table]
+
+
+def run_explore(max_episodes, time_limit, seed_start=None):
+    """Directed exploration: run learning episodes with SIM_EXPLORE=1
+    (the sim takes a state's never-tried action whenever it reaches
+    one) until every consulted state has tried both actions, or
+    max_episodes have run. Updates q_table.json, like a training run.
+    Returns (pairs still untried, states whose greedy choice changed)."""
+    before = load_q_snapshot()
+    if before is None:
+        raise SystemExit("No q_table.json to explore -- train one first "
+                         "(`python evaluate.py -n 100`).")
+    todo = untried_pairs(before)
+    action_name = ("WAIT", "GO")
+    if not todo:
+        print("Every consulted state has tried both actions -- nothing "
+              "to explore.")
+        return [], []
+    print(f"{len(todo)} never-tried action(s): "
+          + ", ".join(f"{state_name(s)} {action_name[a]}" for s, a in todo))
+    print(f"Exploring for up to {max_episodes} episodes "
+          f"(time limit {time_limit:.0f}s each)...\n")
+
+    for i in range(max_episodes):
+        seed = None if seed_start is None else seed_start + i
+        record = run_episode(time_limit, seed, {"SIM_EXPLORE": "1"})
+        table = load_q_snapshot()
+        filled = [p for p in todo if p not in untried_pairs(table)]
+        todo = [p for p in todo if p not in filled]
+        status = ("CRASH" if record["crashed"]
+                  else "ok  " if record["success"] else "FAIL")
+        print(f"ep {i + 1:>3}  {status}  "
+              + (", ".join(f"tried {state_name(s)} {action_name[a]}"
+                           for s, a in filled) or "-")
+              + f"  ({len(todo)} left)")
+        if record["crashed"]:
+            print(f"      {record['error'][:200]}")
+        if not todo:
+            break
+
+    after = load_q_snapshot()
+    before_policy, after_policy = greedy_policy(before), greedy_policy(after)
+    changed = [s for s in range(len(after))
+               if before_policy[s] != after_policy[s]]
+    print("\n==== Exploration summary ====")
+    print(f"{'state':>10}  {'WAIT':>8}  {'GO':>8}  policy")
+    for s, row in enumerate(after):
+        note = (f"{before_policy[s]} -> {after_policy[s]}"
+                if s in changed else after_policy[s])
+        print(f"{state_name(s):>10}  {row[0]:+8.2f}  {row[1]:+8.2f}  {note}")
+    if todo:
+        print("Still untried (that state never came up): "
+              + ", ".join(f"{state_name(s)} {action_name[a]}"
+                          for s, a in todo)
+              + " -- run --explore again with more episodes.")
+    if changed:
+        print(f"The greedy policy changed in {len(changed)} state(s). "
+              f"Re-measure it frozen with `python evaluate.py --ab 40`.")
+    else:
+        print("The greedy policy is unchanged.")
+    return todo, changed
 
 
 def style_axis(ax):
@@ -445,12 +531,24 @@ def main():
                              "(a q_table.json, or an eval_results_*.json "
                              "with a final_q_table) instead of "
                              "q_table.json, which is left untouched")
+    parser.add_argument("--explore", type=int, metavar="N", default=None,
+                        help="directed exploration: run up to N learning "
+                             "episodes in which the agent takes any "
+                             "never-tried action first, stopping once "
+                             "every consulted state has tried both; "
+                             "updates q_table.json")
     parser.add_argument("--tag", default=None,
                         help="label this run: outputs become "
                              "eval_results_<tag>.json / "
                              "learning_curve_<tag>.png and the tag "
                              "appears in the figure title")
     args = parser.parse_args()
+    if args.explore is not None:
+        if args.ab or args.q_from or args.fresh or args.tag:
+            parser.error("--explore can't be combined with --ab, --q-from, "
+                         "--fresh or --tag")
+        if args.explore < 1:
+            parser.error("--explore needs at least 1 episode")
     if args.q_from and not args.ab:
         parser.error("--q-from only applies to --ab")
     if args.q_from:
@@ -472,6 +570,10 @@ def main():
         run_ab(args.ab, args.time_limit,
                args.seed_start if args.seed_start is not None else 1,
                q_from=args.q_from)
+        return
+
+    if args.explore is not None:
+        run_explore(args.explore, args.time_limit, args.seed_start)
         return
 
     if args.fresh and os.path.exists(Q_FILE):
