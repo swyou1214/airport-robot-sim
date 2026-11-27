@@ -47,7 +47,7 @@ airport-robot/
 ├── evaluation/             # Eval records + learning curves (committed portfolio artifacts)
 ├── ab_comparison/          # A/B records + figure (committed)
 ├── docs/                   # Captured runs: demo.gif, two_robots.gif
-├── tests/                  # pytest suite (17 tests: unit + headless end-to-end)
+├── tests/                  # pytest suite (29 tests: unit + headless end-to-end)
 ├── .github/workflows/ci.yml# CI: runs the suite on every push / PR
 ├── README.md               # User-facing documentation
 └── PROJECT_ARGO_SUMMARY.md # This file
@@ -218,7 +218,7 @@ episode, and writes `evaluation/eval_results.json` + `learning_curve.png`
 
 ```
 python evaluate.py [-n N] [--fresh] [--seed-start K] [--time-limit S] [--tag NAME]
-python evaluate.py --ab N [--seed-start K]   # paired A/B, see below
+python evaluate.py --ab N [--seed-start K] [--q-from FILE]   # paired A/B, see below
 ```
 
 Sim-side hooks (env vars, all no-ops in normal GUI use):
@@ -283,7 +283,9 @@ If you last saw the old summary, these are the deltas:
 
 **A/B: learned crossing vs rule baseline** (`evaluate.py --ab N`).
 `SIM_CROSSING=q|rule` swaps the service-road controller; `SIM_FREEZE_Q=1`
-makes the Q arm greedy with no updates. Every seed runs under both arms
+makes the Q arm greedy with no updates; `SIM_Q_FILE=<path>` points the
+sim at a Q-table other than `q_table.json` (unreadable or wrong-layout
+file = hard error, never a silent blank table). Every seed runs under both arms
 (identical traffic), which removes the traffic variance that would
 otherwise swamp the effect. New `hold=` field in RESULT measures seconds
 held at that crossing, from the commanded signal and position, so both
@@ -296,12 +298,26 @@ Q faster on 9 seeds, rule faster on 0, tied on 31. -> ab_comparison/ab_compariso
 (Contested = either arm held > 0.05s; faster/tied use the same 0.05s
 margin. Figures re-verified against ab_comparison.json, 2026-11.)
 
-**Reproducibility caveat:** both arms run with `SIM_FREEZE_Q=1`, and the
-Q arm freezes whatever `q_table.json` is on disk. That file is
-gitignored, so `--ab` on a fresh clone compares a *blank* table against
-the rule and will not reproduce the numbers above. The README tells
-users to train first (`evaluate.py -n 100`); a proper fix is listed in
-*Suggested next steps*.
+**Reproducing it from a clone** (2026-11): `q_table.json` is gitignored,
+so plain `--ab` on a fresh clone would freeze a *blank* table. Use
+`--ab 40 --q-from evaluation/eval_results_trained-policy.json`, which
+hands the committed `final_q_table` to the sim via `SIM_Q_FILE`. That
+table (run 121) isn't the exact one the A/B was recorded with (run 141),
+but a frozen greedy policy only acts on each state's argmax. The run-141
+table wasn't saved, so that can't be compared directly; the committed
+table and the later run-276 `q_table.json` share every argmax, and the
+re-run below made the recorded decision on every seed.
+
+Verified by re-running exactly that with `q_table.json` removed: every
+seed's success, collisions, near-misses and GO/WAIT decision matched the
+recording, and both arms' mean holds came out the same (0.49s vs
+1.06s). Per-seed timings drifted by ≤ 0.03s (not investigated: the sim
+gained the round-trip and fleet code after the A/B was recorded, and
+the Python build changed). One effect of that drift: seed 7's rule hold
+went 0.05 → 0.06s, crossing the 0.05s contested threshold, so a re-run
+reports 24 contested seeds / Q faster on 10 / 0.82s vs 1.76s (−53%)
+instead of 23 / 9 / 0.85s vs 1.83s (−54%). Same decisions throughout;
+the committed `ab_comparison.json` keeps the original recording.
 
 **Round trip** (`SIM_RETURN=1`, opt-in). Gate -> depot by a different
 route: apron (offset lane) -> Gate A connector -> service road ->
@@ -404,10 +420,10 @@ GAP_BUCKETS = [3, 5, 7, 9]  # Q-state distance boundaries (m)
 ## Suggested next steps
 
 ### High priority
-- [ ] **Make the A/B reproducible from a clone** — let `--ab` load the
-      committed `final_q_table` from
-      `evaluation/eval_results_trained-policy.json` (e.g. a
-      `--q-from <file>` flag) instead of the gitignored `q_table.json`
+- [x] **Make the A/B reproducible from a clone** — `--ab --q-from
+      evaluation/eval_results_trained-policy.json` evaluates the
+      committed `final_q_table` via `SIM_Q_FILE`, leaving the gitignored
+      `q_table.json` untouched (2026-11)
 - [ ] **Harness `--explore` flag** — temporarily raise ε to fill the
       remaining zero Q-states, then re-freeze
 - [ ] **Multi-crossing Q-learning** — extend the agent to the apron

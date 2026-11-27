@@ -6,6 +6,7 @@ exercised here the same way evaluate.py drives them -- a full episode
 covers route following, crossing safety, the Q-agent, and persistence
 in one pass, on every push.
 """
+import json
 import os
 import re
 import subprocess
@@ -93,3 +94,48 @@ def test_capture_writes_composite_gif(tmp_path):
     assert im.n_frames >= 10
     # composite frame: 3D panel + divider + map panel, wider than tall
     assert im.size[0] > im.size[1] * 2
+
+
+def _uniform_q_table(tmp_path, action):
+    """A frozen table that prefers one action in every state, written
+    where SIM_Q_FILE can point at it."""
+    row = [5.0, 0.0] if action == "WAIT" else [0.0, 5.0]
+    path = tmp_path / f"q_{action}.json"
+    path.write_text(json.dumps({"q_table": [list(row) for _ in range(10)]}))
+    return path
+
+
+@pytest.mark.parametrize("action", ["WAIT", "GO"])
+def test_sim_q_file_drives_the_crossing_decision(tmp_path, action):
+    """SIM_Q_FILE is what lets `evaluate.py --ab --q-from` measure a
+    committed table on a fresh clone: the sim must decide from that
+    file, and leave the repo's own q_table.json alone. Seed 205's
+    service-road crossing is contested, so a decision is always made;
+    flipping the table flips it."""
+    q_json = ROOT / "q_table.json"
+    before = q_json.read_bytes() if q_json.exists() else None
+    result = run_sim({"SIM_SEED": "205", "SIM_TIME_LIMIT": "150",
+                      "SIM_FREEZE_Q": "1",
+                      "SIM_Q_FILE": str(_uniform_q_table(tmp_path, action))})
+    assert result["success"] == "1"
+    decided = "wait" if action == "WAIT" else "go"
+    other = "go" if action == "WAIT" else "wait"
+    assert int(result[decided]) >= 1
+    assert int(result[other]) == 0
+    after = q_json.read_bytes() if q_json.exists() else None
+    assert after == before
+
+
+def test_sim_q_file_rejects_a_bad_table(tmp_path):
+    """A wrong-layout table must stop the run, not silently fall back
+    to a blank (untrained) policy."""
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"q_table": [[1.0, 2.0]]}))
+    env = os.environ.copy()
+    env.update({"SIM_HEADLESS": "1", "SIM_TIME_LIMIT": "5",
+                "SIM_Q_FILE": str(bad)})
+    proc = subprocess.run([sys.executable, str(ROOT / "robot_sim.py")],
+                          capture_output=True, text=True, env=env,
+                          cwd=str(ROOT), timeout=300)
+    assert proc.returncode != 0
+    assert "wrong layout" in proc.stderr

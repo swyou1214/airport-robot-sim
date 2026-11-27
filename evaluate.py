@@ -21,6 +21,9 @@ Usage:
   python evaluate.py --fresh          # wipe q_table.json first
   python evaluate.py --seed-start 1   # reproducible seeds 1..N
   python evaluate.py --time-limit 180 # per-episode sim-time cap (s)
+  python evaluate.py --ab 40          # paired A/B vs the rule baseline
+  python evaluate.py --ab 40 --q-from evaluation/eval_results_trained-policy.json
+                                      # A/B on the committed trained table
 """
 import argparse
 import json
@@ -29,6 +32,7 @@ import re
 import statistics
 import subprocess
 import sys
+import tempfile
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 SIM_FILE = os.path.join(BASE, "robot_sim.py")
@@ -98,6 +102,31 @@ def load_q_snapshot():
             return json.load(f)["q_table"]
     except (OSError, json.JSONDecodeError, KeyError):
         return None
+
+
+def load_q_source(path):
+    """Read a Q-table from either a q_table.json-style file
+    ({"q_table": ...}) or an evaluation record ({"final_q_table": ...},
+    e.g. the committed evaluation/eval_results_trained-policy.json).
+    Raises ValueError if neither holds a table of [WAIT, GO] pairs --
+    the A/B must never fall back to an untrained policy unnoticed."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"can't read {path}: {e}") from e
+    table = None
+    if isinstance(data, dict):
+        table = data.get("q_table", data.get("final_q_table"))
+    if (not isinstance(table, list) or not table
+            or not all(isinstance(row, list) and len(row) == 2
+                       and all(isinstance(v, (int, float)) for v in row)
+                       for row in table)):
+        raise ValueError(f"{path} has no 'q_table' or 'final_q_table' "
+                         f"of [WAIT, GO] value pairs")
+    if not any(any(row) for row in table):
+        raise ValueError(f"{path} holds an all-zero (untrained) Q-table")
+    return table
 
 
 def q_table_delta(before, after):
@@ -285,15 +314,37 @@ def plot_ab(seeds, q_records, rule_records, out_path):
     return True
 
 
-def run_ab(n, time_limit, seed_start):
+def run_ab(n, time_limit, seed_start, q_from=None):
     """Paired A/B: every seed is run under both crossing controllers,
     so both policies face identical traffic. The Q arm runs frozen
     (greedy, no updates) so the comparison measures the learned policy
-    rather than exploration noise."""
-    if not os.path.exists(Q_FILE):
-        print("WARNING: no q_table.json -- the Q arm will be an untrained "
-              "policy. Run `python evaluate.py -n 40 --fresh` first.\n")
+    rather than exploration noise.
 
+    q_from: evaluate the Q-table stored in that file (see load_q_source)
+    instead of q_table.json. It is copied to a temporary file handed to
+    the sim via SIM_Q_FILE, so q_table.json is never read or touched."""
+    if q_from is None:
+        if not os.path.exists(Q_FILE):
+            print("WARNING: no q_table.json -- the Q arm will be an "
+                  "untrained policy. Train one first "
+                  "(`python evaluate.py -n 100`) or evaluate the committed "
+                  "table with `--q-from "
+                  "evaluation/eval_results_trained-policy.json`.\n")
+        _run_ab(n, time_limit, seed_start, {}, "q_table.json")
+        return
+
+    table = load_q_source(q_from)
+    with tempfile.TemporaryDirectory() as tmp:
+        q_path = os.path.join(tmp, "q_table.json")
+        with open(q_path, "w") as f:
+            json.dump({"q_table": table, "epsilon": 0.0, "run_count": 0,
+                       "total_crossings": 0}, f)
+        print(f"Q arm policy: {q_from}\n")
+        _run_ab(n, time_limit, seed_start, {"SIM_Q_FILE": q_path},
+                os.path.relpath(os.path.abspath(q_from), BASE))
+
+
+def _run_ab(n, time_limit, seed_start, q_env, q_source):
     seeds = [seed_start + i for i in range(n)]
     q_records, rule_records = [], []
     print(f"Paired A/B over {n} seeds (identical traffic per pair)\n")
@@ -301,9 +352,10 @@ def run_ab(n, time_limit, seed_start):
           f"{'rule hold':>9} {'rule time':>9}   winner")
     for seed in seeds:
         q = run_episode(time_limit, seed,
-                        {"SIM_CROSSING": "q", "SIM_FREEZE_Q": "1"})
+                        {"SIM_CROSSING": "q", "SIM_FREEZE_Q": "1", **q_env})
         r = run_episode(time_limit, seed,
-                        {"SIM_CROSSING": "rule", "SIM_FREEZE_Q": "1"})
+                        {"SIM_CROSSING": "rule", "SIM_FREEZE_Q": "1",
+                         **q_env})
         q_records.append(q)
         rule_records.append(r)
         margin = r["hold"] - q["hold"]
@@ -359,6 +411,7 @@ def run_ab(n, time_limit, seed_start):
               f"{sum(r['near_misses'] for _, r in contested)}")
 
     payload = {"seeds": seeds, "time_limit": time_limit,
+               "q_source": q_source,
                "q": {"summary": q_sum, "episodes": q_records},
                "rule": {"summary": r_sum, "episodes": rule_records},
                "hold_deltas": deltas}
@@ -387,12 +440,24 @@ def main():
                              "Q-learning crossing policy and the "
                              "rule-based baseline, then report the "
                              "comparison (implies frozen greedy Q)")
+    parser.add_argument("--q-from", metavar="FILE", default=None,
+                        help="with --ab: evaluate the Q-table in FILE "
+                             "(a q_table.json, or an eval_results_*.json "
+                             "with a final_q_table) instead of "
+                             "q_table.json, which is left untouched")
     parser.add_argument("--tag", default=None,
                         help="label this run: outputs become "
                              "eval_results_<tag>.json / "
                              "learning_curve_<tag>.png and the tag "
                              "appears in the figure title")
     args = parser.parse_args()
+    if args.q_from and not args.ab:
+        parser.error("--q-from only applies to --ab")
+    if args.q_from:
+        try:
+            load_q_source(args.q_from)   # fail before any episode runs
+        except ValueError as e:
+            parser.error(str(e))
 
     results_json = RESULTS_JSON
     curve_png = CURVE_PNG
@@ -405,7 +470,8 @@ def main():
     if args.ab:
         os.makedirs(AB_DIR, exist_ok=True)
         run_ab(args.ab, args.time_limit,
-               args.seed_start if args.seed_start is not None else 1)
+               args.seed_start if args.seed_start is not None else 1,
+               q_from=args.q_from)
         return
 
     if args.fresh and os.path.exists(Q_FILE):
